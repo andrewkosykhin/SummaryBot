@@ -35,6 +35,7 @@
 
 import asyncio
 import base64
+import contextlib
 import datetime
 import io
 import json
@@ -60,6 +61,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -258,6 +260,26 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     await summarize_chat(context.bot, context.job.chat_id, silent_if_empty=True)
 
 
+# ---------- «печатает…» ----------
+
+@contextlib.asynccontextmanager
+async def typing(bot: Bot, chat_id: int):
+    """Держит в чате статус «печатает…», пока идёт работа (Telegram гасит его через ~5 с)."""
+    async def keep():
+        while True:
+            try:
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            except Exception:
+                pass  # нет прав или канал — не страшно
+            await asyncio.sleep(4)
+
+    task = asyncio.create_task(keep())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
 # ---------- кончились деньги у ИИ ----------
 
 QUOTA_NOTICE_EVERY = datetime.timedelta(hours=6)
@@ -329,9 +351,10 @@ async def summarize_chat(bot: Bot, chat_id: int, silent_if_empty: bool = False):
             await bot.send_message(chat_id, "Пока нечего саммарить — сообщений нет.")
         return
     try:
-        summary = await make_summary(
-            s["prompt"] or DEFAULT_PROMPT, build_transcript(rows)
-        )
+        async with typing(bot, chat_id):
+            summary = await make_summary(
+                s["prompt"] or DEFAULT_PROMPT, build_transcript(rows)
+            )
     except Exception as e:
         log.exception("Ошибка при запросе к ИИ для чата %s", chat_id)
         provider = quota_provider(e)
@@ -618,9 +641,12 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
-    text, reply, retry = await process_media(
-        spec, context, s["prompt"] or DEFAULT_PROMPT, chat.id, author
-    )
+    # стикеры обрабатываются мгновенно — им «печатает…» не нужен
+    quiet = spec["kind"] == "sticker"
+    async with (contextlib.nullcontext() if quiet else typing(context.bot, chat.id)):
+        text, reply, retry = await process_media(
+            spec, context, s["prompt"] or DEFAULT_PROMPT, chat.id, author
+        )
     save_message(chat.id, author, text, msg.date,
                  media=spec if retry else None, tg_msg_id=msg.message_id)
     if reply:
@@ -642,9 +668,10 @@ async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Это не голосовое, не кружочек и не картинка.")
             return
         author = message_author(Update(0, message=target)) or "?"
-        text, reply, retry = await process_media(
-            spec, context, prompt, chat.id, author, always_notify=True
-        )
+        async with typing(context.bot, chat.id):
+            text, reply, retry = await process_media(
+                spec, context, prompt, chat.id, author, always_notify=True
+            )
         row = find_media_row(chat.id, author, target.date, target.message_id)
         if row:
             set_message_text(row["id"], text, spec if retry else None)
@@ -666,9 +693,10 @@ async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = 0
     for r in rows:
         spec = json.loads(r["media"])
-        text, reply, retry = await process_media(
-            spec, context, prompt, chat.id, r["author"]
-        )
+        async with typing(context.bot, chat.id):
+            text, reply, retry = await process_media(
+                spec, context, prompt, chat.id, r["author"]
+            )
         set_message_text(r["id"], text, spec if retry else None)
         ok += not retry
         if reply:
