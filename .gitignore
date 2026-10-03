@@ -1,0 +1,20 @@
+# секреты — никогда не коммитим
+run.sh
+.env
+*.env
+!env.example
+
+# данные бота
+data/
+*.db
+*.sql
+*.sqlite*
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
