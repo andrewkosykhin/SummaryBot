@@ -1,11 +1,16 @@
-# Переменные окружения (передаются при запуске, через .env или -e):
+# Переменные окружения (передаются при запуске, через --env-file .env или -e):
 #   TELEGRAM_TOKEN     — обязательно, токен бота от @BotFather
 #   ANTHROPIC_API_KEY  — обязательно, ключ Claude API
+#   OPENAI_API_KEY     — необязательно, для расшифровки голосовых и кружочков
 #   SUMMARY_TIME       — необязательно, время саммари для новых чатов (по умолчанию 21:00)
 #   TZ_NAME            — необязательно, часовой пояс для всех чатов (по умолчанию Europe/Moscow)
-#   MODEL              — необязательно, модель (по умолчанию claude-sonnet-5-5)
+#   MODEL              — необязательно, модель саммари (по умолчанию claude-sonnet-5-5)
+#   VISION_MODEL       — необязательно, модель для картинок (по умолчанию как MODEL)
+#   FAST_MODEL         — необязательно, модель реакций на голосовые (по умолчанию claude-haiku-4-5)
+#   STT_MODEL          — необязательно, модель расшифровки (по умолчанию gpt-4o-transcribe)
 #
-# Пример: docker run -d -e TELEGRAM_TOKEN=... -e ANTHROPIC_API_KEY=... -v gopbot-data:/data gopbot
+# Пример: docker run -d --env-file .env -v "$PWD/data:/data" summarybot
+# (папка data должна принадлежать uid 1000 — от него работает бот)
 
 FROM python:3.12-slim
 
