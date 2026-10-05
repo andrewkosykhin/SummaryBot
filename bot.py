@@ -34,7 +34,7 @@
     /settings            — текущие настройки чата
     /settime 21:30       — время ежедневного саммари
     /setprompt <текст>   — свой промпт (или ответом на сообщение с текстом)
-    /summary             — сделать саммари прямо сейчас
+    /summary             — саммари на сейчас (только показать: память и итоги дня не трогает)
     /memory              — что бот помнит о чате (итоги дней, недель, месяцев, лет)
     /retry [N]           — перераспознать последние N неудачных голосовых/картинок
                            (или ответь /retry на конкретное сообщение)
@@ -539,7 +539,14 @@ async def send_long(bot: Bot, chat_id: int, text: str):
         await bot.send_message(chat_id, text[i : i + TG_MSG_LIMIT])
 
 
-async def summarize_chat(bot: Bot, chat_id: int, silent_if_empty: bool = False):
+async def summarize_chat(
+    bot: Bot, chat_id: int, silent_if_empty: bool = False, preview: bool = False
+):
+    """Итоги дня по таймеру: постит, пишет день в память и очищает сообщения.
+
+    preview=True (ручной /summary) — только показывает саммари на сейчас: ничего не
+    удаляет и в память не пишет, чтобы ручные вызовы не дробили день.
+    """
     s = get_chat(chat_id)
     if not s:
         return
@@ -560,9 +567,15 @@ async def summarize_chat(bot: Bot, chat_id: int, silent_if_empty: bool = False):
             text = (f"🪫 У меня кончились токены в {provider} — саммари не сделать. "
                     "Пополните баланс, сообщения не потеряются.")
         else:
-            text = "ИИ не ответил, попробую в следующий раз."
+            text = "ИИ не ответил, попробуй позже." if preview else \
+                "ИИ не ответил, попробую в следующий раз."
         await bot.send_message(chat_id, text)
         return  # сообщения не удаляем — уйдут в следующее саммари
+    if preview:
+        await send_long(
+            bot, chat_id, f"🗞 Саммари на сейчас ({len(rows)} сообщ.):\n\n{summary['post']}"
+        )
+        return
     await send_long(bot, chat_id, f"🗞 Итоги дня ({len(rows)} сообщ.):\n\n{summary['post']}")
     save_summary(chat_id, "day", local_date(rows[0]["ts"]), local_date(rows[-1]["ts"]),
                  summary["facts"], summary["post"])
@@ -1141,7 +1154,7 @@ async def cmd_setprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
-    await summarize_chat(context.bot, update.effective_chat.id)
+    await summarize_chat(context.bot, update.effective_chat.id, preview=True)
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:
@@ -1309,7 +1322,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show(menu_text(chat.id), menu_kb())
         case ["summary"]:
             await q.answer("Делаю саммари…")
-            await summarize_chat(context.bot, chat.id)
+            await summarize_chat(context.bot, chat.id, preview=True)
             await show(menu_text(chat.id), menu_kb())
         case ["time"]:
             await q.answer()
@@ -1348,7 +1361,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # меню команд по "/"; в каналах Telegram его не показывает, там вводим руками
 GROUP_COMMANDS = [
     BotCommand("menu", "Меню на кнопках"),
-    BotCommand("summary", "Саммари прямо сейчас"),
+    BotCommand("summary", "Саммари на сейчас"),
     BotCommand("settime", "Время ежедневного саммари"),
     BotCommand("setprompt", "Свой промпт для саммари"),
     BotCommand("settings", "Текущие настройки"),
