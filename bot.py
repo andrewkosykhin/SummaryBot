@@ -21,6 +21,8 @@
                           фото разбирается одной пачкой (по умолчанию 10)
     MAX_BATCH_PHOTOS    — сколько фото из серии смотреть (по умолчанию 10); альбом
                           разбирается целиком
+    MAX_LINKS           — сколько ссылок из сообщения открывать и описывать для саммари
+                          (по умолчанию 3, 0 — не открывать)
 
 ВАЖНО:
   * Группы: в @BotFather выполни /setprivacy -> Disable, иначе бот видит
@@ -65,6 +67,7 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MessageEntity,
     Update,
 )
 from telegram.constants import ChatAction
@@ -87,6 +90,7 @@ FAST_MODEL = os.getenv("FAST_MODEL", "claude-haiku-4-5")
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
 PHOTO_BATCH_WAIT = float(os.getenv("PHOTO_BATCH_WAIT", "10"))
 MAX_BATCH_PHOTOS = max(1, int(os.getenv("MAX_BATCH_PHOTOS", "10")))
+MAX_LINKS = max(0, int(os.getenv("MAX_LINKS", "3")))
 DB_PATH = os.getenv("DB_PATH", "messages.db")
 
 MAX_TRANSCRIPT_CHARS = 150_000  # чтобы не улететь в лимиты модели
@@ -217,12 +221,19 @@ def save_message(
     tg_msg_id: int | None = None,
 ):
     with db() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages (chat_id, author, text, ts, media, tg_msg_id)"
             " VALUES (?, ?, ?, ?, ?, ?)",
             (chat_id, author, text, ts.isoformat(),
              json.dumps(media) if media else None, tg_msg_id),
         )
+        return cur.lastrowid
+
+
+def append_message_text(row_id: int, extra: str):
+    # если саммари уже забрало сообщение — строки нет, и ладно
+    with db() as conn:
+        conn.execute("UPDATE messages SET text = text || ? WHERE id = ?", (extra, row_id))
 
 
 def failed_media(chat_id: int, limit: int):
@@ -590,7 +601,72 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
-    save_message(chat.id, author, msg.text, msg.date)
+    row_id = save_message(chat.id, author, msg.text, msg.date)
+    urls = message_urls(msg)
+    if urls:
+        # открываем ссылки фоном, чтобы не держать остальные апдейты
+        context.application.create_task(enrich_links(row_id, urls, chat.id))
+
+
+# ---------- ссылки ----------
+
+# web_fetch — серверный инструмент Claude: страницу открывает Anthropic, не наш сервер
+LINK_TOOL = {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 1,
+             "max_content_tokens": 8000}
+
+
+def message_urls(msg) -> list[str]:
+    """Ссылки из сообщения: явные и спрятанные под текст, без повторов."""
+    if not MAX_LINKS:
+        return []
+    urls = []
+    for ent, text in msg.parse_entities([MessageEntity.URL, MessageEntity.TEXT_LINK]).items():
+        url = ent.url if ent.type == MessageEntity.TEXT_LINK else text
+        if not re.match(r"^https?://", url, re.I):
+            url = "http://" + url
+        if url not in urls:
+            urls.append(url)
+    return urls[:MAX_LINKS]
+
+
+async def describe_link(url: str) -> str:
+    messages = [{"role": "user", "content": f"Открой ссылку и опиши её: {url}"}]
+    for _ in range(3):  # pause_turn — сервер просит продолжить
+        resp = await ai.messages.create(
+            model=FAST_MODEL,
+            max_tokens=1000,
+            system=(
+                "Ты пишешь заметку в хронику чата о присланной ссылке. Всегда сначала открой "
+                "её инструментом web_fetch — даже если домен знакомый. Потом коротко и "
+                "нейтрально опиши, что там: 1–2 предложения, о чём страница или документ, "
+                "без оценок. Если не открылась, пустая или это заглушка (логин, капча, "
+                "cookie-баннер) — так и скажи одной фразой. Ответ — только сама заметка: "
+                "не обращайся к собеседнику и ничего не предлагай."
+            ),
+            tools=[LINK_TOOL],
+            messages=messages,
+        )
+        if resp.stop_reason != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": resp.content})
+    # берём только итоговый текст — после результата web_fetch, без «сейчас открою…»
+    blocks = resp.content
+    done = [i for i, b in enumerate(blocks) if b.type == "web_fetch_tool_result"]
+    tail = blocks[done[-1] + 1 :] if done else blocks
+    return "".join(b.text for b in tail if b.type == "text").strip()
+
+
+async def enrich_links(row_id: int, urls: list[str], chat_id: int):
+    """Открывает ссылки и дописывает их описание к сообщению в базе. В чат не пишет."""
+    notes = []
+    for url in urls:
+        try:
+            note = await describe_link(url) or "не открылась"
+        except Exception as e:
+            log.info("Ссылка %s в чате %s не открылась: %s", url, chat_id, e)
+            note = "не открылась"
+        notes.append(f"\n[ссылка {url}: {note}]")
+    append_message_text(row_id, "".join(notes))
 
 
 # ---------- картинки и голосовые ----------
