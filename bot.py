@@ -109,6 +109,12 @@ DEFAULT_PROMPT = (
     "а не травишь. Объём — до 2000 символов."
 )
 
+# Telegram показывает текст как есть: **жирный** и # заголовки вылезут звёздочками и решётками
+PLAIN_TEXT = (
+    "Пиши обычным текстом без markdown: без **, __, `, # и маркированных списков. "
+    "Эмодзи можно."
+)
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -494,7 +500,7 @@ async def facts_and_post(prompt: str, level: str, content: str) -> dict:
         f"Уложись примерно в {DETAIL_LIMITS[MEMORY_DETAIL][level]} символов.\n"
         "post — текст для отправки в чат, строго по инструкции стиля ниже. "
         "Инструкция стиля относится ТОЛЬКО к post.\n\n"
-        f"Инструкция стиля для post:\n{prompt}"
+        f"Инструкция стиля для post:\n{prompt}\n\n{PLAIN_TEXT}"
     )
     resp = await ai.messages.create(
         model=MODEL,
@@ -653,7 +659,16 @@ async def run_rollups(bot: Bot, chat_id: int):
         )
 
 
+def strip_markdown(text: str) -> str:
+    """Подчищает markdown, если модель всё-таки его написала."""
+    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), text, flags=re.S)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.M)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    return text
+
+
 async def send_long(bot: Bot, chat_id: int, text: str):
+    text = strip_markdown(text)
     for i in range(0, len(text), TG_MSG_LIMIT):
         await bot.send_message(chat_id, text[i : i + TG_MSG_LIMIT])
 
@@ -843,7 +858,7 @@ async def retell_link(note: str, prompt: str) -> str:
     resp = await ai.messages.create(
         model=FAST_MODEL,
         max_tokens=1000,
-        system=prompt,
+        system=f"{prompt}\n\n{PLAIN_TEXT}",
         messages=[{
             "role": "user",
             "content": "Человек скинул в чат ссылку. Вот что на ней (нейтральная заметка). "
@@ -913,7 +928,7 @@ async def describe_images(
         f"картинках, если это мем — в чём шутка. Без стиля, мата и оценок, {size}.\n"
         f"post — реакция для отправки в чат, {size}, с парой подходящих эмодзи, строго "
         "по инструкции стиля ниже. Инструкция стиля относится ТОЛЬКО к post.\n\n"
-        f"Инструкция стиля для post:\n{prompt}"
+        f"Инструкция стиля для post:\n{prompt}\n\n{PLAIN_TEXT}"
     )
     content = [
         {
@@ -998,7 +1013,7 @@ async def react_to_voice(transcript: str, prompt: str, author: str, gender: str 
     resp = await ai.messages.create(
         model=FAST_MODEL,
         max_tokens=400,
-        system=prompt,
+        system=f"{prompt}\n\n{PLAIN_TEXT}",
         messages=[{
             "role": "user",
             "content": "Это расшифровка голосового сообщения из чата. Отреагируй на него "
@@ -1123,6 +1138,7 @@ async def process_media(
 
 
 async def send_reply(bot: Bot, chat_id: int, reply_to: int | None, text: str):
+    text = strip_markdown(text)
     try:
         for i in range(0, len(text), TG_MSG_LIMIT):
             await bot.send_message(
@@ -1391,7 +1407,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
             resp = await ai.messages.create(
                 model=MODEL,
                 max_tokens=16000,
-                system=s["prompt"] or DEFAULT_PROMPT,
+                system=f"{s['prompt'] or DEFAULT_PROMPT}\n\n{PLAIN_TEXT}",
                 messages=[{
                     "role": "user",
                     "content": "Вот твои заметки о том, что было в этом чате. Расскажи "
