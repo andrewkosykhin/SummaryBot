@@ -1049,9 +1049,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_chat(chat.id)
     memory = memory_text(chat.id)
     if not memory:
-        await update.effective_message.reply_text(
-            f"Пока ничего не помню — первое саммари в {s['summary_time']}."
-        )
+        await update.effective_message.reply_text("Пока ничего не помню.")
         return
     try:
         # пересказ в стиле чата — только для показа, в память не сохраняется
