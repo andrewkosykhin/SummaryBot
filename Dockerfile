@@ -8,6 +8,7 @@
 #   VISION_MODEL       — необязательно, модель для картинок (по умолчанию как MODEL)
 #   FAST_MODEL         — необязательно, модель реакций на голосовые (по умолчанию claude-haiku-4-5)
 #   STT_MODEL          — необязательно, модель расшифровки (по умолчанию gpt-4o-transcribe)
+#   MEMORY_DETAIL      — необязательно, подробность памяти: short | normal | full (по умолчанию normal)
 #
 # Пример: docker run -d --env-file .env -v "$PWD/data:/data" summarybot
 # (папка data должна принадлежать uid 1000 — от него работает бот)

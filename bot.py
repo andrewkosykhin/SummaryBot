@@ -16,6 +16,7 @@
     FAST_MODEL          — модель для реакций на голосовые, по умолчанию claude-haiku-4-5
     OPENAI_API_KEY      — ключ OpenAI для расшифровки голосовых (без него не расшифровываем)
     STT_MODEL           — модель расшифровки, по умолчанию gpt-4o-transcribe
+    MEMORY_DETAIL       — подробность памяти: short | normal | full (по умолчанию normal)
 
 ВАЖНО:
   * Группы: в @BotFather выполни /setprivacy -> Disable, иначе бот видит
@@ -29,6 +30,7 @@
     /setprompt <текст>   — свой промпт (или ответом на сообщение с текстом)
     /summary             — сделать саммари прямо сейчас
     /stats               — сколько сообщений накоплено
+    /memory              — что бот помнит о чате (итоги дней, недель, месяцев, лет)
     /retry [N]           — перераспознать последние N неудачных голосовых/картинок
                            (или ответь /retry на конкретное сообщение)
 """
@@ -102,6 +104,22 @@ log = logging.getLogger("gopbot")
 ai = AsyncAnthropic()  # берёт ANTHROPIC_API_KEY из окружения
 stt = AsyncOpenAI() if os.getenv("OPENAI_API_KEY") else None
 
+# подробность нейтральных заметок (facts), которые бот хранит в памяти
+DETAIL_LIMITS = {
+    "short": {"day": 500, "week": 700, "month": 900, "year": 1200},
+    "normal": {"day": 1500, "week": 2000, "month": 2500, "year": 3000},
+    "full": {"day": 5000, "week": 6000, "month": 7000, "year": 8000},
+}
+DETAIL_HINTS = {
+    "short": "только главные темы и события",
+    "normal": "темы, кто что сказал или решил, договорённости, цифры",
+    "full": "максимально подробно: все темы, участники, цитаты ключевых фраз, ссылки, даты",
+}
+MEMORY_DETAIL = os.getenv("MEMORY_DETAIL", "normal").strip().lower()
+if MEMORY_DETAIL not in DETAIL_LIMITS:
+    log.warning("MEMORY_DETAIL=%r не знаю, беру normal", MEMORY_DETAIL)
+    MEMORY_DETAIL = "normal"
+
 
 # ---------- база ----------
 
@@ -123,6 +141,20 @@ def db():
             title TEXT,
             summary_time TEXT NOT NULL,
             prompt TEXT
+        )"""
+    )
+    # память: итоги дней/недель/месяцев/лет. parent_id — в какую свёртку вошла запись
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            level TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            facts TEXT NOT NULL,
+            post TEXT,
+            created_at TEXT NOT NULL,
+            parent_id INTEGER
         )"""
     )
     # миграция: нераспознанное медиа (JSON) и id сообщения в Telegram — для /retry
@@ -166,6 +198,7 @@ def all_chats() -> list[sqlite3.Row]:
 def forget_chat(chat_id: int):
     with db() as conn:
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM summaries WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
 
@@ -228,6 +261,34 @@ def delete_up_to(chat_id: int, max_id: int):
         conn.execute("DELETE FROM messages WHERE chat_id = ? AND id <= ?", (chat_id, max_id))
 
 
+def save_summary(chat_id: int, level: str, start: str, end: str, facts: str, post: str) -> int:
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO summaries (chat_id, level, period_start, period_end, facts, post,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, level, start, end, facts, post,
+             datetime.datetime.now(datetime.timezone.utc).isoformat()),
+        )
+        return cur.lastrowid
+
+
+def live_summaries(chat_id: int, level: str) -> list[sqlite3.Row]:
+    """Записи уровня, которые ещё не вошли в свёртку, от старых к новым."""
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM summaries WHERE chat_id = ? AND level = ? AND parent_id IS NULL"
+            " ORDER BY period_start, id",
+            (chat_id, level),
+        ).fetchall()
+
+
+def mark_compacted(ids: list[int], parent_id: int):
+    with db() as conn:
+        conn.executemany(
+            "UPDATE summaries SET parent_id = ? WHERE id = ?", [(parent_id, i) for i in ids]
+        )
+
+
 # ---------- расписание ----------
 
 def job_name(chat_id: int) -> str:
@@ -258,6 +319,7 @@ def unschedule_chat(app: Application, chat_id: int):
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     await summarize_chat(context.bot, context.job.chat_id, silent_if_empty=True)
+    await run_rollups(context.bot, context.job.chat_id)
 
 
 # ---------- «печатает…» ----------
@@ -326,14 +388,125 @@ def build_transcript(rows) -> str:
     return transcript
 
 
-async def make_summary(prompt: str, transcript: str) -> str:
+LEVEL_NAMES = {"day": "день", "week": "неделя", "month": "месяц", "year": "год"}
+# (что сворачиваем, во что, сколько нужно)
+ROLLUPS = [("day", "week", 7), ("week", "month", 4), ("month", "year", 12)]
+ROLLUP_TITLES = {"week": "🗓 Итоги недели", "month": "📅 Итоги месяца", "year": "🎆 Итоги года"}
+ROLLUP_ASK = {
+    "week": "Вот итоги по дням. Сделай итог недели",
+    "month": "Вот итоги по неделям. Сделай итог месяца",
+    "year": "Вот итоги по месяцам. Сделай итог года",
+}
+
+FACTS_POST_SCHEMA = {
+    "type": "object",
+    "properties": {"facts": {"type": "string"}, "post": {"type": "string"}},
+    "required": ["facts", "post"],
+    "additionalProperties": False,
+}
+
+
+async def facts_and_post(prompt: str, level: str, content: str) -> dict:
+    """Один запрос — два текста: нейтральные facts для памяти и post в стиле чата.
+
+    Стиль чата касается только post: в память и в свёртки идут facts, поэтому
+    стиль не накапливается от уровня к уровню.
+    """
+    system = (
+        "Ты ведёшь хронику чата и отвечаешь JSON с двумя полями.\n"
+        "facts — нейтральные заметки для долговременной памяти: без стиля, мата, оценок "
+        f"и шуток. Включи: {DETAIL_HINTS[MEMORY_DETAIL]}. Упоминай участников по именам. "
+        f"Уложись примерно в {DETAIL_LIMITS[MEMORY_DETAIL][level]} символов.\n"
+        "post — текст для отправки в чат, строго по инструкции стиля ниже. "
+        "Инструкция стиля относится ТОЛЬКО к post.\n\n"
+        f"Инструкция стиля для post:\n{prompt}"
+    )
     resp = await ai.messages.create(
         model=MODEL,
         max_tokens=16000,  # с запасом: часть уходит на размышления модели
-        system=prompt,
-        messages=[{"role": "user", "content": f"Вот переписка за день:\n\n{transcript}"}],
+        system=system,
+        messages=[{"role": "user", "content": content}],
+        output_config={"format": {"type": "json_schema", "schema": FACTS_POST_SCHEMA}},
     )
-    return "".join(b.text for b in resp.content if b.type == "text").strip()
+    if resp.stop_reason in ("refusal", "max_tokens"):
+        raise RuntimeError(f"модель не дописала ответ: {resp.stop_reason}")
+    data = json.loads(next(b.text for b in resp.content if b.type == "text"))
+    return {"facts": data["facts"].strip(), "post": data["post"].strip()}
+
+
+async def make_summary(prompt: str, transcript: str, memory: str = "") -> dict:
+    content = f"Вот переписка за день:\n\n{transcript}"
+    if memory:
+        content = (
+            "Память чата (что было раньше) — используй для отсылок и связей, "
+            f"но саммари — про сегодняшнюю переписку:\n\n{memory}\n\n---\n\n{content}"
+        )
+    return await facts_and_post(prompt, "day", content)
+
+
+async def make_rollup(prompt: str, level: str, items: list[sqlite3.Row]) -> dict:
+    notes = "\n\n".join(
+        f"[{fmt_period(r['period_start'], r['period_end'])}] {r['facts']}" for r in items
+    )
+    content = (
+        f"{ROLLUP_ASK[level]}: главные темы, события, кто отличился, "
+        f"что изменилось за период.\n\n{notes}"
+    )
+    return await facts_and_post(prompt, level, content)
+
+
+def fmt_period(start: str, end: str) -> str:
+    a, b = datetime.date.fromisoformat(start), datetime.date.fromisoformat(end)
+    if a == b:
+        return f"{a:%d.%m.%Y}"
+    if a.year == b.year:
+        return f"{a:%d.%m}–{b:%d.%m.%Y}"
+    return f"{a:%d.%m.%Y}–{b:%d.%m.%Y}"
+
+
+def memory_text(chat_id: int) -> str:
+    """Нейтральная память чата: годы → месяцы → недели → дни (только facts)."""
+    parts = []
+    for level in ("year", "month", "week", "day"):
+        for r in live_summaries(chat_id, level):
+            period = fmt_period(r["period_start"], r["period_end"])
+            parts.append(f"[{LEVEL_NAMES[level]} {period}] {r['facts']}")
+    return "\n\n".join(parts)
+
+
+def local_date(ts: str) -> str:
+    return datetime.datetime.fromisoformat(ts).astimezone(TZ).date().isoformat()
+
+
+async def run_rollups(bot: Bot, chat_id: int):
+    """Сворачивает накопленное: 7 дней → неделя, 4 недели → месяц, 12 месяцев → год."""
+    s = get_chat(chat_id)
+    if not s:
+        return
+    prompt = s["prompt"] or DEFAULT_PROMPT
+    for child, parent, need in ROLLUPS:
+        items = live_summaries(chat_id, child)
+        # несколько /summary за день — всё равно один день
+        count = len({r["period_end"] for r in items}) if child == "day" else len(items)
+        if count < need:
+            continue
+        try:
+            async with typing(bot, chat_id):
+                res = await make_rollup(prompt, parent, items)
+        except Exception as e:
+            log.exception("Не смог свернуть %s → %s в чате %s", child, parent, chat_id)
+            notice = quota_notice(chat_id, e, f"подводить итоги ({LEVEL_NAMES[parent]})")
+            if notice:
+                await bot.send_message(chat_id, notice)
+            return  # накопленное останется живым — попробуем со следующим таймером
+        start = items[0]["period_start"]
+        end = max(r["period_end"] for r in items)
+        pid = save_summary(chat_id, parent, start, end, res["facts"], res["post"])
+        mark_compacted([r["id"] for r in items], pid)
+        log.info("Чат %s: %d × %s → %s #%d", chat_id, len(items), child, parent, pid)
+        await send_long(
+            bot, chat_id, f"{ROLLUP_TITLES[parent]} ({fmt_period(start, end)}):\n\n{res['post']}"
+        )
 
 
 async def send_long(bot: Bot, chat_id: int, text: str):
@@ -353,7 +526,7 @@ async def summarize_chat(bot: Bot, chat_id: int, silent_if_empty: bool = False):
     try:
         async with typing(bot, chat_id):
             summary = await make_summary(
-                s["prompt"] or DEFAULT_PROMPT, build_transcript(rows)
+                s["prompt"] or DEFAULT_PROMPT, build_transcript(rows), memory_text(chat_id)
             )
     except Exception as e:
         log.exception("Ошибка при запросе к ИИ для чата %s", chat_id)
@@ -365,7 +538,9 @@ async def summarize_chat(bot: Bot, chat_id: int, silent_if_empty: bool = False):
             text = "ИИ не ответил, попробую в следующий раз."
         await bot.send_message(chat_id, text)
         return  # сообщения не удаляем — уйдут в следующее саммари
-    await send_long(bot, chat_id, f"🗞 Итоги дня ({len(rows)} сообщ.):\n\n{summary}")
+    await send_long(bot, chat_id, f"🗞 Итоги дня ({len(rows)} сообщ.):\n\n{summary['post']}")
+    save_summary(chat_id, "day", local_date(rows[0]["ts"]), local_date(rows[-1]["ts"]),
+                 summary["facts"], summary["post"])
     delete_up_to(chat_id, max(r["id"] for r in rows))
 
 
@@ -789,6 +964,38 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Накоплено сообщений: {n}")
 
 
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context):
+        return
+    chat = update.effective_chat
+    s = get_chat(chat.id)
+    memory = memory_text(chat.id)
+    if not memory:
+        await update.effective_message.reply_text(
+            f"Пока ничего не помню — первое саммари в {s['summary_time']}."
+        )
+        return
+    try:
+        # пересказ в стиле чата — только для показа, в память не сохраняется
+        async with typing(context.bot, chat.id):
+            resp = await ai.messages.create(
+                model=MODEL,
+                max_tokens=16000,
+                system=s["prompt"] or DEFAULT_PROMPT,
+                messages=[{
+                    "role": "user",
+                    "content": "Вот твои заметки о том, что было в этом чате. Расскажи "
+                    "участникам, что ты помнишь: от давнего к свежему — год, месяцы, недели, "
+                    "последние дни. Ничего не выдумывай сверх заметок.\n\n" + memory,
+                }],
+            )
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as e:
+        log.exception("Не смог пересказать память чата %s", chat.id)
+        text = quota_notice(chat.id, e, "вспоминать", always=True) or "ИИ не ответил, попробуй позже."
+    await send_long(context.bot, chat.id, f"🧠 Что я помню:\n\n{text}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(__doc__.split("Команды в чате")[1].strip(" :\n"))
 
@@ -914,6 +1121,7 @@ GROUP_COMMANDS = [
     BotCommand("setprompt", "Свой промпт для саммари"),
     BotCommand("settings", "Текущие настройки"),
     BotCommand("stats", "Сколько сообщений накоплено"),
+    BotCommand("memory", "Что бот помнит о чате"),
     BotCommand("retry", "Перераспознать голосовые/картинки"),
     BotCommand("help", "Справка"),
 ]
@@ -967,6 +1175,7 @@ def main():
         "help": cmd_help,
         "menu": cmd_menu,
         "retry": cmd_retry,
+        "memory": cmd_memory,
         "start": cmd_help,
     }
     for name, handler in commands.items():
