@@ -10,12 +10,13 @@
     ANTHROPIC_API_KEY   — ключ Claude API (console.anthropic.com)
     SUMMARY_TIME        — время саммари по умолчанию для новых чатов (21:00)
     TZ_NAME             — часовой пояс для всех чатов (Europe/Moscow)
-    MODEL               — модель, по умолчанию claude-sonnet-5-5
+    ANTHROPIC_MODEL     — модель саммари и памяти, по умолчанию claude-sonnet-5-5
     DB_PATH             — путь к базе (в Docker по умолчанию /data/db.sql)
-    VISION_MODEL        — модель для картинок, по умолчанию как MODEL
-    FAST_MODEL          — модель для реакций на голосовые, по умолчанию claude-haiku-4-5
+    ANTHROPIC_VISION_MODEL — модель для картинок, по умолчанию как ANTHROPIC_MODEL
+    ANTHROPIC_FAST_MODEL — модель для реакций на голосовые и ссылок, по умолчанию
+                          claude-haiku-4-5
     OPENAI_API_KEY      — ключ OpenAI для расшифровки голосовых (без него не расшифровываем)
-    STT_MODEL           — модель расшифровки, по умолчанию gpt-4o-transcribe
+    OPENAI_STT_MODEL    — модель расшифровки голосовых, по умолчанию gpt-4o-transcribe
     MEMORY_DETAIL       — подробность памяти: short | normal | full (по умолчанию normal)
     PHOTO_BATCH_WAIT    — сек. тишины после последнего фото автора, после которых серия
                           фото разбирается одной пачкой (по умолчанию 10)
@@ -82,10 +83,10 @@ from telegram.ext import (
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 DEFAULT_TIME = os.getenv("SUMMARY_TIME", "21:00")
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
-MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
-VISION_MODEL = os.getenv("VISION_MODEL", MODEL)
-FAST_MODEL = os.getenv("FAST_MODEL", "claude-haiku-4-5")
-STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+VISION_MODEL = os.getenv("ANTHROPIC_VISION_MODEL", MODEL)
+FAST_MODEL = os.getenv("ANTHROPIC_FAST_MODEL", "claude-haiku-4-5")
+STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-transcribe")
 PHOTO_BATCH_WAIT = float(os.getenv("PHOTO_BATCH_WAIT", "10"))
 MAX_BATCH_PHOTOS = max(1, int(os.getenv("MAX_BATCH_PHOTOS", "10")))
 MAX_LINKS = max(0, int(os.getenv("MAX_LINKS", "3")))
