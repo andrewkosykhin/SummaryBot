@@ -24,6 +24,8 @@
                           разбирается целиком
     MAX_LINKS           — сколько ссылок из сообщения открывать и описывать для саммари
                           (по умолчанию 3, 0 — не открывать)
+    DAY_PART_CHARS      — если за день накопилось больше стольких символов, бот фоном
+                          сжимает накопленное в заметки «часть дня» (по умолчанию 100000)
 
 ВАЖНО:
   * Группы: в @BotFather выполни /setprivacy -> Disable, иначе бот видит
@@ -90,6 +92,7 @@ STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-transcribe")
 PHOTO_BATCH_WAIT = float(os.getenv("PHOTO_BATCH_WAIT", "10"))
 MAX_BATCH_PHOTOS = max(1, int(os.getenv("MAX_BATCH_PHOTOS", "10")))
 MAX_LINKS = max(0, int(os.getenv("MAX_LINKS", "3")))
+DAY_PART_CHARS = max(10_000, int(os.getenv("DAY_PART_CHARS", "100000")))
 DB_PATH = os.getenv("DB_PATH", "messages.db")
 
 MAX_TRANSCRIPT_CHARS = 150_000  # чтобы не улететь в лимиты модели
@@ -506,14 +509,83 @@ async def facts_and_post(prompt: str, level: str, content: str) -> dict:
     return {"facts": data["facts"].strip(), "post": data["post"].strip()}
 
 
-async def make_summary(prompt: str, transcript: str, memory: str = "") -> dict:
-    content = f"Вот переписка за день:\n\n{transcript}"
+async def make_summary(prompt: str, transcript: str, memory: str = "", parts: str = "") -> dict:
+    if parts and transcript:
+        content = (
+            f"Начало дня уже сжато в заметки:\n\n{parts}\n\n---\n\n"
+            f"Переписка после этого:\n\n{transcript}"
+        )
+    elif parts:
+        content = f"Заметки по переписке за день:\n\n{parts}"
+    else:
+        content = f"Вот переписка за день:\n\n{transcript}"
     if memory:
         content = (
             "Память чата (что было раньше) — используй для отсылок и связей, "
             f"но саммари — про сегодняшнюю переписку:\n\n{memory}\n\n---\n\n{content}"
         )
     return await facts_and_post(prompt, "day", content)
+
+
+async def make_day_part(transcript: str) -> str:
+    """Нейтральные заметки по куску дня — когда переписки слишком много для одного запроса."""
+    resp = await ai.messages.create(
+        model=MODEL,
+        max_tokens=16000,
+        system=(
+            "Ты ведёшь хронику чата. Сожми этот кусок дневной переписки в нейтральные "
+            "заметки: без стиля, мата, оценок и шуток. Упоминай участников по именам. "
+            f"Включи: {DETAIL_HINTS[MEMORY_DETAIL]}. Уложись примерно в "
+            f"{DETAIL_LIMITS[MEMORY_DETAIL]['day']} символов. Ответ — только заметки."
+        ),
+        messages=[{"role": "user", "content": transcript}],
+    )
+    if resp.stop_reason in ("refusal", "max_tokens"):
+        raise RuntimeError(f"модель не дописала ответ: {resp.stop_reason}")
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def day_parts_text(parts: list[sqlite3.Row]) -> str:
+    return "\n\n".join(f"[часть дня {r['period_start']}] {r['facts']}" for r in parts)
+
+
+# один на чат: сжатие части дня и итоги дня не должны забрать одни и те же сообщения
+_day_locks: dict[int, asyncio.Lock] = {}
+
+
+def day_lock(chat_id: int) -> asyncio.Lock:
+    return _day_locks.setdefault(chat_id, asyncio.Lock())
+
+
+def pending_chars(chat_id: int) -> int:
+    with db() as conn:
+        return conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(text)), 0) FROM messages WHERE chat_id = ?", (chat_id,)
+        ).fetchone()[0]
+
+
+async def maybe_compact_day(chat_id: int):
+    """Если за день накопилось больше DAY_PART_CHARS — сжимаем накопленное в «часть дня»
+    и удаляем эти сообщения. Итоги дня потом соберутся из частей и свежего хвоста."""
+    lock = day_lock(chat_id)
+    if lock.locked() or pending_chars(chat_id) < DAY_PART_CHARS:
+        return
+    async with lock:
+        rows = fetch_messages(chat_id)
+        if sum(len(r["text"]) for r in rows) < DAY_PART_CHARS:
+            return
+        try:
+            facts = await make_day_part(build_transcript(rows))
+        except Exception:
+            log.exception("Не смог сжать часть дня в чате %s", chat_id)
+            return  # сообщения на месте — попробуем на следующем сообщении или в итогах дня
+        t0 = datetime.datetime.fromisoformat(rows[0]["ts"]).astimezone(TZ)
+        t1 = datetime.datetime.fromisoformat(rows[-1]["ts"]).astimezone(TZ)
+        # period_start куска — с временем: «2026-10-05 09:12–14:40», для заголовка в итогах дня
+        save_summary(chat_id, "part", f"{t0:%Y-%m-%d %H:%M}–{t1:%H:%M}",
+                     t1.date().isoformat(), facts, None)
+        delete_up_to(chat_id, max(r["id"] for r in rows))
+        log.info("Чат %s: сжал часть дня (%d сообщ.)", chat_id, len(rows))
 
 
 async def make_rollup(prompt: str, level: str, items: list[sqlite3.Row]) -> dict:
@@ -593,40 +665,53 @@ async def summarize_chat(
 
     preview=True (ручной /summary) — только показывает саммари на сейчас: ничего не
     удаляет и в память не пишет, чтобы ручные вызовы не дробили день.
+    Если день был большой, его начало уже лежит в заметках «часть дня» — они тоже идут в итоги.
     """
     s = get_chat(chat_id)
     if not s:
         return
-    rows = fetch_messages(chat_id)
-    if not rows:
-        if not silent_if_empty:
-            await bot.send_message(chat_id, "Пока нечего саммарить — сообщений нет.")
-        return
-    try:
-        async with typing(bot, chat_id):
-            summary = await make_summary(
-                s["prompt"] or DEFAULT_PROMPT, build_transcript(rows), memory_text(chat_id)
-            )
-    except Exception as e:
-        log.exception("Ошибка при запросе к ИИ для чата %s", chat_id)
-        provider = quota_provider(e)
-        if provider:
-            text = (f"🪫 У меня кончились токены в {provider} — саммари не сделать. "
-                    "Пополните баланс, сообщения не потеряются.")
+    lock = contextlib.nullcontext() if preview else day_lock(chat_id)
+    async with lock:
+        rows = fetch_messages(chat_id)
+        parts = live_summaries(chat_id, "part")
+        if not rows and not parts:
+            if not silent_if_empty:
+                await bot.send_message(chat_id, "Пока нечего саммарить — сообщений нет.")
+            return
+        try:
+            async with typing(bot, chat_id):
+                summary = await make_summary(
+                    s["prompt"] or DEFAULT_PROMPT, build_transcript(rows),
+                    memory_text(chat_id), day_parts_text(parts),
+                )
+        except Exception as e:
+            log.exception("Ошибка при запросе к ИИ для чата %s", chat_id)
+            provider = quota_provider(e)
+            if provider:
+                text = (f"🪫 У меня кончились токены в {provider} — саммари не сделать. "
+                        "Пополните баланс, сообщения не потеряются.")
+            else:
+                text = "ИИ не ответил, попробуй позже." if preview else \
+                    "ИИ не ответил, попробую в следующий раз."
+            await bot.send_message(chat_id, text)
+            return  # сообщения не удаляем — уйдут в следующее саммари
+        title = "🗞 Саммари на сейчас" if preview else "🗞 Итоги дня"
+        if not parts:
+            n = f"{len(rows)} сообщ."
+        elif rows:
+            n = f"сжатое начало дня + {len(rows)} сообщ."
         else:
-            text = "ИИ не ответил, попробуй позже." if preview else \
-                "ИИ не ответил, попробую в следующий раз."
-        await bot.send_message(chat_id, text)
-        return  # сообщения не удаляем — уйдут в следующее саммари
-    if preview:
-        await send_long(
-            bot, chat_id, f"🗞 Саммари на сейчас ({len(rows)} сообщ.):\n\n{summary['post']}"
-        )
-        return
-    await send_long(bot, chat_id, f"🗞 Итоги дня ({len(rows)} сообщ.):\n\n{summary['post']}")
-    save_summary(chat_id, "day", local_date(rows[0]["ts"]), local_date(rows[-1]["ts"]),
-                 summary["facts"], summary["post"])
-    delete_up_to(chat_id, max(r["id"] for r in rows))
+            n = "по сжатым заметкам за день"
+        await send_long(bot, chat_id, f"{title} ({n}):\n\n{summary['post']}")
+        if preview:
+            return
+        dates = [r["period_end"] for r in parts] + [local_date(r["ts"]) for r in rows]
+        start = min([r["period_start"][:10] for r in parts] + [local_date(r["ts"]) for r in rows])
+        day_id = save_summary(chat_id, "day", start, max(dates), summary["facts"], summary["post"])
+        if parts:
+            mark_compacted([r["id"] for r in parts], day_id)
+        if rows:
+            delete_up_to(chat_id, max(r["id"] for r in rows))
 
 
 # ---------- проверки ----------
@@ -696,6 +781,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return  # это настройка, а не реплика в чате
     capture_bot_reply(update, context)
     row_id = save_message(chat.id, author, msg.text, msg.date)
+    context.application.create_task(maybe_compact_day(chat.id))
     urls = message_urls(msg)
     if urls:
         # открываем ссылки фоном, чтобы не держать остальные апдейты
@@ -771,8 +857,8 @@ async def retell_link(note: str, prompt: str) -> str:
 async def enrich_links(row_id: int, urls: list[str], chat_id: int, bot: Bot, reply_to: int):
     """Открывает ссылки и дописывает их описание к сообщению в базе.
 
-    Если в чате включён пересказ ссылок — ещё и отвечает в чат в стиле промпта
-    (с превью ссылки). В базу идёт только нейтральная заметка.
+    Если в чате включён пересказ ссылок — ещё и отвечает в чат реплаем в стиле промпта
+    (сама ссылка уже видна в цитате). В базу идёт только нейтральная заметка.
     """
     s = get_chat(chat_id)
     notes = []
@@ -792,7 +878,7 @@ async def enrich_links(row_id: int, urls: list[str], chat_id: int, bot: Bot, rep
             log.exception("Не смог пересказать ссылку в чате %s", chat_id)
             text = quota_notice(chat_id, e, "пересказывать ссылки")
         if text:
-            await send_reply(bot, chat_id, reply_to, f"🔗 {text}\n\n{url}")
+            await send_reply(bot, chat_id, reply_to, f"🔗 {text}")
     append_message_text(row_id, "".join(notes))
 
 
@@ -1106,6 +1192,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     save_message(chat.id, author, text, msg.date,
                  media=spec if retry else None, tg_msg_id=msg.message_id)
+    context.application.create_task(maybe_compact_day(chat.id))
     if reply:
         await send_reply(context.bot, chat.id, msg.message_id, reply)
 
