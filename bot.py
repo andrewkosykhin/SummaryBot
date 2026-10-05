@@ -30,12 +30,11 @@
   * Каналы: бота нужно сделать админом канала.
 
 Команды в чате (настройки у каждого чата свои, менять может любой участник):
-    /menu                — меню на кнопках (удобно в канале)
+    /menu                — меню на кнопках и статистика: накоплено, до саммари, память
     /settings            — текущие настройки чата
     /settime 21:30       — время ежедневного саммари
     /setprompt <текст>   — свой промпт (или ответом на сообщение с текстом)
     /summary             — сделать саммари прямо сейчас
-    /stats               — сколько сообщений накоплено
     /memory              — что бот помнит о чате (итоги дней, недель, месяцев, лет)
     /retry [N]           — перераспознать последние N неудачных голосовых/картинок
                            (или ответь /retry на конкретное сообщение)
@@ -1111,11 +1110,63 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await summarize_chat(context.bot, update.effective_chat.id)
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update, context):
-        return
-    n = len(fetch_messages(update.effective_chat.id))
-    await update.effective_message.reply_text(f"Накоплено сообщений: {n}")
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} {one}"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} {few}"
+    return f"{n} {many}"
+
+
+def until_summary(summary_time: str) -> str:
+    now = datetime.datetime.now(TZ)
+    hh, mm = map(int, summary_time.split(":"))
+    nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += datetime.timedelta(days=1)
+    mins = int((nxt - now).total_seconds() // 60)
+    h, m = divmod(mins, 60)
+    return f"{h} ч {m} мин" if h else f"{m} мин"
+
+
+def stats_text(chat_id: int) -> str:
+    """Статистика чата: что накоплено, сколько до саммари, что в памяти."""
+    s = get_chat(chat_id)
+    rows = fetch_messages(chat_id)
+    texts = [r["text"] for r in rows]
+    voices = sum(t.startswith(("[голосовое", "[кружочек")) for t in texts)
+    images = sum(bool(re.match(r"\[(картинка|\d+ фото)", t)) for t in texts)
+    links = sum(t.count("\n[ссылка ") for t in texts)
+    extra = [x for x in (
+        voices and plural(voices, "голосовое", "голосовых", "голосовых"),
+        images and plural(images, "картинка", "картинки", "картинок"),
+        links and plural(links, "ссылка", "ссылки", "ссылок"),
+    ) if x]
+    lines = [
+        f"💬 Накоплено сообщений: {len(rows)}" + (f" ({', '.join(extra)})" if extra else ""),
+        f"⏳ До саммари: {until_summary(s['summary_time'])} (в {s['summary_time']})",
+    ]
+
+    # вся история, включая уже свёрнутое: сколько дней бот знает чат и сколько итогов подвёл
+    with db() as conn:
+        days, since = conn.execute(
+            "SELECT COUNT(DISTINCT period_end), MIN(period_start) FROM summaries"
+            " WHERE chat_id = ? AND level = 'day'", (chat_id,),
+        ).fetchone()
+        done = dict(conn.execute(
+            "SELECT level, COUNT(*) FROM summaries WHERE chat_id = ? GROUP BY level", (chat_id,),
+        ).fetchall())
+    if not days:
+        lines.append("🧠 Память: пока пусто")
+    else:
+        lines.append(
+            f"🧠 Помню {plural(days, 'день', 'дня', 'дней')} "
+            f"(с {datetime.date.fromisoformat(since):%d.%m.%Y}): "
+            f"{plural(done.get('week', 0), 'неделя', 'недели', 'недель')}, "
+            f"{plural(done.get('month', 0), 'месяц', 'месяца', 'месяцев')}, "
+            f"{plural(done.get('year', 0), 'год', 'года', 'лет')}"
+        )
+    return "\n".join(lines)
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1156,12 +1207,11 @@ TIME_PRESETS = ["09:00", "12:00", "15:00", "18:00", "20:00", "21:00", "22:00", "
 def menu_text(chat_id: int) -> str:
     s = get_chat(chat_id)
     kind = "свой" if s["prompt"] else "по умолчанию"
-    n = len(fetch_messages(chat_id))
     return (
         "🤖 Меню бота\n"
         f"⏰ Саммари каждый день в {s['summary_time']}\n"
         f"📝 Промпт: {kind}\n"
-        f"💬 Накоплено сообщений: {n}"
+        + stats_text(chat_id)
     )
 
 
@@ -1268,7 +1318,6 @@ GROUP_COMMANDS = [
     BotCommand("settime", "Время ежедневного саммари"),
     BotCommand("setprompt", "Свой промпт для саммари"),
     BotCommand("settings", "Текущие настройки"),
-    BotCommand("stats", "Сколько сообщений накоплено"),
     BotCommand("memory", "Что бот помнит о чате"),
     BotCommand("retry", "Перераспознать голосовые/картинки"),
 ]
@@ -1317,7 +1366,6 @@ def main():
         "settime": cmd_settime,
         "setprompt": cmd_setprompt,
         "summary": cmd_summary,
-        "stats": cmd_stats,
         "menu": cmd_menu,
         "retry": cmd_retry,
         "memory": cmd_memory,
