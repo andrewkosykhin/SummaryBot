@@ -602,23 +602,30 @@ MAX_AUDIO_BYTES = 20 * 1024 * 1024  # больше Bot API не отдаёт
 
 async def describe_images(
     images: list[tuple[bytes, str]], prompt: str, caption: str, total: int
-) -> str:
-    """Описывает одну картинку или пачку целиком, одним запросом."""
+) -> dict:
+    """Одна картинка или пачка — одним запросом. Возвращает {facts, post}:
+    facts — нейтральное описание для базы и саммари, post — реакция в стиле чата.
+    """
     if len(images) == 1:
-        ask = (
-            "Это картинка из чата. Опиши в 1–3 предложениях, что на ней: что изображено, "
-            "текст на картинке, если это мем — в чём шутка."
-        )
+        ask = "Это картинка из чата."
+        size = "1–3 предложения"
     else:
         ask = (
             f"Это {len(images)} картинок, которые человек отправил в чат подряд"
             + (f" (из {total}, остальные не показаны)" if total > len(images) else "")
-            + ". Разбери их вместе, как одну историю: что на них, что их связывает, "
-            "текст на картинках, если это мемы — в чём шутка. 2–5 предложений."
+            + ". Разбери их вместе, как одну историю: что их связывает."
         )
-    ask += " Добавь пару подходящих эмодзи. Описание пойдёт в дневное саммари."
+        size = "2–5 предложений"
     if caption:
         ask += f"\nПодпись: {caption}"
+    system = (
+        "Ты смотришь картинки из чата и отвечаешь JSON с двумя полями.\n"
+        "facts — нейтральное описание для хроники чата: что изображено, текст на "
+        f"картинках, если это мем — в чём шутка. Без стиля, мата и оценок, {size}.\n"
+        f"post — реакция для отправки в чат, {size}, с парой подходящих эмодзи, строго "
+        "по инструкции стиля ниже. Инструкция стиля относится ТОЛЬКО к post.\n\n"
+        f"Инструкция стиля для post:\n{prompt}"
+    )
     content = [
         {
             "type": "image",
@@ -633,11 +640,17 @@ async def describe_images(
     resp = await ai.messages.create(
         model=VISION_MODEL,
         max_tokens=4000,  # с запасом: часть уходит на размышления модели
-        output_config={"effort": "low"},
-        system=prompt,
+        output_config={
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": FACTS_POST_SCHEMA},
+        },
+        system=system,
         messages=[{"role": "user", "content": content + [{"type": "text", "text": ask}]}],
     )
-    return "".join(b.text for b in resp.content if b.type == "text").strip()
+    if resp.stop_reason in ("refusal", "max_tokens"):
+        raise RuntimeError(f"модель не дописала ответ: {resp.stop_reason}")
+    data = json.loads(next(b.text for b in resp.content if b.type == "text"))
+    return {"facts": data["facts"].strip(), "post": data["post"].strip()}
 
 
 def voice_pitch(data: bytes) -> float | None:
@@ -777,7 +790,8 @@ async def process_media(
                 f = await context.bot.get_file(p["file_id"])
                 images.append((bytes(await f.download_as_bytearray()), p["media_type"]))
             desc = await describe_images(images, prompt, caption, total)
-            return f"[{what}{seen}: {desc}]{tail}", f"🖼 {desc}", False
+            # в базу — нейтральное описание, в чат — реакция в стиле промпта
+            return f"[{what}{seen}: {desc['facts']}]{tail}", f"🖼 {desc['post']}", False
         except Exception as e:
             log.exception("Не смог описать картинки в чате %s", chat_id)
             notice = quota_notice(chat_id, e, "смотреть картинки", always_notify)
