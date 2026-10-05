@@ -30,10 +30,8 @@
   * Каналы: бота нужно сделать админом канала.
 
 Команды в чате (настройки у каждого чата свои, менять может любой участник):
-    /menu                — меню на кнопках и статистика: накоплено, до саммари, память
-    /settings            — текущие настройки чата
-    /settime 21:30       — время ежедневного саммари
-    /setprompt <текст>   — свой промпт (или ответом на сообщение с текстом)
+    /menu                — меню: статистика, саммари на сейчас, настройки (время, промпт,
+                           пересказ ссылок). В канале: /menu time 21:30, /menu prompt <текст>
     /summary             — саммари на сейчас (только показать: память и итоги дня не трогает)
     /memory              — что бот помнит о чате (итоги дней, недель, месяцев, лет)
     /retry [N]           — перераспознать последние N неудачных голосовых/картинок
@@ -65,6 +63,7 @@ from telegram import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
     InlineKeyboardButton,
+    ForceReply,
     InlineKeyboardMarkup,
     MessageEntity,
     Update,
@@ -179,6 +178,13 @@ def db():
     if "media" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN media TEXT")
         conn.execute("ALTER TABLE messages ADD COLUMN tg_msg_id INTEGER")
+    # миграция: отвечать ли в чат пересказом ссылок (по умолчанию выкл)
+    chat_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)")}
+    if "link_replies" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN link_replies INTEGER NOT NULL DEFAULT 0")
+    # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
+    if "active" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     return conn
 
 
@@ -202,7 +208,7 @@ def get_chat(chat_id: int) -> sqlite3.Row | None:
 
 
 def update_chat(chat_id: int, field: str, value):
-    assert field in ("summary_time", "prompt", "title")
+    assert field in ("summary_time", "prompt", "title", "link_replies", "active")
     with db() as conn:
         conn.execute(f"UPDATE chats SET {field} = ? WHERE chat_id = ?", (value, chat_id))
 
@@ -212,12 +218,12 @@ def all_chats() -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM chats").fetchall()
 
 
-def forget_chat(chat_id: int):
+def wipe_chat_data(chat_id: int):
+    """Стирает накопленное и память чата. Настройки (время, промпт) остаются."""
     with db() as conn:
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM summaries WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM seen_bot_msgs WHERE chat_id = ?", (chat_id,))
-        conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
 
 def save_message(
@@ -645,12 +651,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
+    if await on_settings_reply(update, context):
+        return  # это настройка, а не реплика в чате
     capture_bot_reply(update, context)
     row_id = save_message(chat.id, author, msg.text, msg.date)
     urls = message_urls(msg)
     if urls:
         # открываем ссылки фоном, чтобы не держать остальные апдейты
-        context.application.create_task(enrich_links(row_id, urls, chat.id))
+        context.application.create_task(
+            enrich_links(row_id, urls, chat.id, context.bot, msg.message_id)
+        )
 
 
 # ---------- ссылки ----------
@@ -701,16 +711,47 @@ async def describe_link(url: str) -> str:
     return "".join(b.text for b in tail if b.type == "text").strip()
 
 
-async def enrich_links(row_id: int, urls: list[str], chat_id: int):
-    """Открывает ссылки и дописывает их описание к сообщению в базе. В чат не пишет."""
+async def retell_link(note: str, prompt: str) -> str:
+    """Пересказ нейтральной заметки о ссылке в стиле промпта чата — только для ответа в чат."""
+    resp = await ai.messages.create(
+        model=FAST_MODEL,
+        max_tokens=1000,
+        system=prompt,
+        messages=[{
+            "role": "user",
+            "content": "Человек скинул в чат ссылку. Вот что на ней (нейтральная заметка). "
+            "Перескажи коротко, 2–4 предложения, что там, и отреагируй. Добавь пару "
+            f"подходящих эмодзи.\n\n{note}",
+        }],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+async def enrich_links(row_id: int, urls: list[str], chat_id: int, bot: Bot, reply_to: int):
+    """Открывает ссылки и дописывает их описание к сообщению в базе.
+
+    Если в чате включён пересказ ссылок — ещё и отвечает в чат в стиле промпта
+    (с превью ссылки). В базу идёт только нейтральная заметка.
+    """
+    s = get_chat(chat_id)
     notes = []
     for url in urls:
         try:
-            note = await describe_link(url) or "не открылась"
+            note = await describe_link(url) or ""
         except Exception as e:
             log.info("Ссылка %s в чате %s не открылась: %s", url, chat_id, e)
-            note = "не открылась"
-        notes.append(f"\n[ссылка {url}: {note}]")
+            note = ""
+        notes.append(f"\n[ссылка {url}: {note or 'не открылась'}]")
+        if not (note and s and s["link_replies"]):
+            continue
+        try:
+            async with typing(bot, chat_id):
+                text = await retell_link(note, s["prompt"] or DEFAULT_PROMPT)
+        except Exception as e:
+            log.exception("Не смог пересказать ссылку в чате %s", chat_id)
+            text = quota_notice(chat_id, e, "пересказывать ссылки")
+        if text:
+            await send_reply(bot, chat_id, reply_to, f"🔗 {text}\n\n{url}")
     append_message_text(row_id, "".join(notes))
 
 
@@ -1085,8 +1126,9 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = update.my_chat_member.new_chat_member.status
     if status in ("member", "administrator"):
         _, created = ensure_chat(chat.id, chat.title)
+        update_chat(chat.id, "active", 1)
+        schedule_chat(context.application, chat.id)  # вернули в чат — таймер снова в деле
         if created:
-            schedule_chat(context.application, chat.id)
             try:
                 await context.bot.send_message(
                     chat.id,
@@ -1097,58 +1139,31 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 log.info("Не смог поздороваться в %s (нет прав писать?)", chat.id)
     elif status in ("left", "kicked"):
+        # память не стираем: вернут бота — продолжит с того же места
         unschedule_chat(context.application, chat.id)
-        forget_chat(chat.id)
-        log.info("Бота убрали из чата %s, данные удалены", chat.id)
+        if get_chat(chat.id):
+            update_chat(chat.id, "active", 0)
+        log.info("Бота убрали из чата %s, данные сохранены", chat.id)
 
 
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update, context):
-        return
-    s = get_chat(update.effective_chat.id)
-    prompt = s["prompt"] or DEFAULT_PROMPT
-    if len(prompt) > 500:
-        prompt = prompt[:500] + "…"
-    kind = "свой" if s["prompt"] else "по умолчанию"
-    await update.effective_message.reply_text(
-        f"⏰ Время: {s['summary_time']}\n"
-        f"📝 Промпт ({kind}):\n{prompt}"
-    )
-
-
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update, context):
-        return
-    msg = update.effective_message
-    m = TIME_RE.match(context.args[0]) if context.args else None
+def apply_time(app: Application, chat_id: int, raw: str) -> str:
+    m = TIME_RE.match(raw.strip())
     if not m:
-        await msg.reply_text("Формат: /settime 21:30")
-        return
+        return "Не понял время. Формат: ЧЧ:ММ, например 21:30."
     value = f"{int(m.group(1)):02d}:{m.group(2)}"
-    update_chat(update.effective_chat.id, "summary_time", value)
-    schedule_chat(context.application, update.effective_chat.id)
-    await msg.reply_text(f"Ок, саммари теперь каждый день в {value}.")
+    update_chat(chat_id, "summary_time", value)
+    schedule_chat(app, chat_id)
+    return f"Ок, саммари теперь каждый день в {value}."
 
 
-async def cmd_setprompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update, context):
-        return
-    msg = update.effective_message
-    parts = msg.text.split(maxsplit=1)  # сохраняем переносы строк
-    text = parts[1].strip() if len(parts) > 1 else ""
-    if not text and msg.reply_to_message and msg.reply_to_message.text:
-        text = msg.reply_to_message.text.strip()
+def apply_prompt(chat_id: int, text: str) -> str:
+    text = text.strip()
     if not text:
-        await msg.reply_text(
-            "Напиши промпт после команды: /setprompt Сделай саммари как пират\n"
-            "или ответь командой /setprompt на сообщение с текстом промпта."
-        )
-        return
+        return "Пустой промпт не годится."
     if len(text) > MAX_PROMPT_CHARS:
-        await msg.reply_text(f"Слишком длинно, максимум {MAX_PROMPT_CHARS} символов.")
-        return
-    update_chat(update.effective_chat.id, "prompt", text)
-    await msg.reply_text("Ок, промпт обновлён.")
+        return f"Слишком длинно, максимум {MAX_PROMPT_CHARS} символов."
+    update_chat(chat_id, "prompt", text)
+    return "Ок, промпт обновлён."
 
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1251,25 +1266,45 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 TIME_PRESETS = ["09:00", "12:00", "15:00", "18:00", "20:00", "21:00", "22:00", "23:00"]
 
 
+# сообщения-запросы бота: ответ на них реплаем меняет настройку
+ASK_TIME = "⏰ Ответь на это сообщение временем саммари в формате ЧЧ:ММ, например 21:30."
+ASK_PROMPT = "📝 Ответь на это сообщение текстом нового промпта для саммари."
+
+
 def menu_text(chat_id: int) -> str:
-    s = get_chat(chat_id)
-    kind = "свой" if s["prompt"] else "по умолчанию"
-    return (
-        "🤖 Меню бота\n"
-        f"⏰ Саммари каждый день в {s['summary_time']}\n"
-        f"📝 Промпт: {kind}\n"
-        + stats_text(chat_id)
-    )
+    return "🤖 Меню бота\n" + stats_text(chat_id)
 
 
 def menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗞 Саммари сейчас", callback_data="m:summary")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="m:settings")],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="m:home")],
+    ])
+
+
+def settings_text(chat_id: int) -> str:
+    s = get_chat(chat_id)
+    kind = "свой" if s["prompt"] else "по умолчанию"
+    return (
+        "⚙️ Настройки чата\n"
+        f"⏰ Саммари каждый день в {s['summary_time']}\n"
+        f"📝 Промпт: {kind}\n"
+        f"🔗 Пересказ ссылок в чат: {'вкл' if s['link_replies'] else 'выкл'}"
+    )
+
+
+def settings_kb(chat_id: int) -> InlineKeyboardMarkup:
+    s = get_chat(chat_id)
+    state = "вкл ✅" if s["link_replies"] else "выкл"
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⏰ Время", callback_data="m:time"),
             InlineKeyboardButton("📝 Промпт", callback_data="m:prompt"),
         ],
-        [InlineKeyboardButton("🔄 Обновить", callback_data="m:home")],
+        [InlineKeyboardButton(f"🔗 Пересказ ссылок: {state}", callback_data="m:links")],
+        [InlineKeyboardButton("🗑 Удалить данные чата", callback_data="m:wipe")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m:home")],
     ])
 
 
@@ -1278,28 +1313,59 @@ def time_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(t, callback_data=f"m:settime:{t}") for t in TIME_PRESETS[i:i + 4]]
         for i in range(0, len(TIME_PRESETS), 4)
     ]
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="m:home")])
+    rows.append([InlineKeyboardButton("✏️ Своё время", callback_data="m:asktime")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="m:settings")])
     return InlineKeyboardMarkup(rows)
 
 
 def prompt_kb(custom: bool) -> InlineKeyboardMarkup:
-    rows = []
+    rows = [[InlineKeyboardButton("✏️ Новый промпт", callback_data="m:askprompt")]]
     if custom:
         rows.append([InlineKeyboardButton("♻️ Сбросить на стандартный", callback_data="m:resetprompt")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="m:home")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="m:settings")])
     return InlineKeyboardMarkup(rows)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/menu — меню. В каналах, где не ответить реплаем на бота, можно и так:
+    /menu time 21:30, /menu prompt <текст> (или ответом на сообщение с текстом)."""
     if not await guard(update, context):
         return
     chat = update.effective_chat
+    msg = update.effective_message
+    args = context.args or []
+    if args and args[0].lower() in ("time", "время"):
+        await msg.reply_text(apply_time(context.application, chat.id, " ".join(args[1:])))
+        return
+    if args and args[0].lower() in ("prompt", "промпт"):
+        parts = msg.text.split(maxsplit=2)  # сохраняем переносы строк
+        text = parts[2] if len(parts) > 2 else ""
+        if not text.strip() and msg.reply_to_message and msg.reply_to_message.text:
+            text = msg.reply_to_message.text
+        await msg.reply_text(apply_prompt(chat.id, text))
+        return
     await context.bot.send_message(chat.id, menu_text(chat.id), reply_markup=menu_kb())
     if chat.type == "channel":  # чтобы "/menu" не висел постом в канале
         try:
-            await update.effective_message.delete()
+            await msg.delete()
         except Exception:
             pass
+
+
+async def on_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Ответ реплаем на запрос бота «пришли время/промпт». True — если это был он."""
+    msg = update.effective_message
+    target = msg.reply_to_message
+    if not target or not target.from_user or target.from_user.id != context.bot.id:
+        return False
+    chat_id = update.effective_chat.id
+    if target.text == ASK_TIME:
+        await msg.reply_text(apply_time(context.application, chat_id, msg.text))
+    elif target.text == ASK_PROMPT:
+        await msg.reply_text(apply_prompt(chat_id, msg.text))
+    else:
+        return False
+    return True
 
 
 async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1324,18 +1390,23 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Делаю саммари…")
             await summarize_chat(context.bot, chat.id, preview=True)
             await show(menu_text(chat.id), menu_kb())
+        case ["settings"]:
+            await q.answer()
+            await show(settings_text(chat.id), settings_kb(chat.id))
         case ["time"]:
             await q.answer()
             s = get_chat(chat.id)
-            await show(
-                f"⏰ Сейчас: {s['summary_time']}\nВыбери время или напиши /settime ЧЧ:ММ",
-                time_kb(),
-            )
+            await show(f"⏰ Сейчас: {s['summary_time']}\nВыбери время:", time_kb())
         case ["settime", value] if TIME_RE.match(value):
             update_chat(chat.id, "summary_time", value)
             schedule_chat(context.application, chat.id)
             await q.answer(f"Саммари теперь в {value}")
-            await show(menu_text(chat.id), menu_kb())
+            await show(settings_text(chat.id), settings_kb(chat.id))
+        case ["asktime"]:
+            await q.answer()
+            await context.bot.send_message(
+                chat.id, ASK_TIME, reply_markup=ForceReply(input_field_placeholder="21:30")
+            )
         case ["prompt"]:
             await q.answer()
             s = get_chat(chat.id)
@@ -1343,14 +1414,33 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(prompt) > 1000:
                 prompt = prompt[:1000] + "…"
             kind = "свой" if s["prompt"] else "по умолчанию"
-            await show(
-                f"📝 Промпт ({kind}):\n{prompt}\n\n"
-                "Поменять: /setprompt <текст> (или ответом на сообщение с текстом).",
-                prompt_kb(bool(s["prompt"])),
-            )
+            await show(f"📝 Промпт ({kind}):\n{prompt}", prompt_kb(bool(s["prompt"])))
+        case ["askprompt"]:
+            await q.answer()
+            await context.bot.send_message(chat.id, ASK_PROMPT, reply_markup=ForceReply())
         case ["resetprompt"]:
             update_chat(chat.id, "prompt", None)
             await q.answer("Промпт сброшен")
+            await show(settings_text(chat.id), settings_kb(chat.id))
+        case ["links"]:
+            on = 0 if get_chat(chat.id)["link_replies"] else 1
+            update_chat(chat.id, "link_replies", on)
+            await q.answer("Пересказ ссылок включён" if on else "Пересказ ссылок выключен")
+            await show(settings_text(chat.id), settings_kb(chat.id))
+        case ["wipe"]:
+            await q.answer()
+            await show(
+                "🗑 Удалить все накопленные сообщения и всю память чата (итоги дней, недель, "
+                "месяцев, лет)? Это не отменить. Настройки — время и промпт — останутся.",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Да, удалить", callback_data="m:wipe:yes")],
+                    [InlineKeyboardButton("◀️ Отмена", callback_data="m:settings")],
+                ]),
+            )
+        case ["wipe", "yes"]:
+            wipe_chat_data(chat.id)
+            log.info("Чат %s: данные удалены по кнопке (%s)", chat.id, q.from_user.id)
+            await q.answer("Данные чата удалены", show_alert=True)
             await show(menu_text(chat.id), menu_kb())
         case _:
             await q.answer()
@@ -1360,11 +1450,8 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # меню команд по "/"; в каналах Telegram его не показывает, там вводим руками
 GROUP_COMMANDS = [
-    BotCommand("menu", "Меню на кнопках"),
+    BotCommand("menu", "Меню: саммари, статистика, настройки"),
     BotCommand("summary", "Саммари на сейчас"),
-    BotCommand("settime", "Время ежедневного саммари"),
-    BotCommand("setprompt", "Свой промпт для саммари"),
-    BotCommand("settings", "Текущие настройки"),
     BotCommand("memory", "Что бот помнит о чате"),
     BotCommand("retry", "Перераспознать голосовые/картинки"),
 ]
@@ -1372,7 +1459,8 @@ GROUP_COMMANDS = [
 
 async def post_init(app: Application):
     for s in all_chats():
-        schedule_chat(app, s["chat_id"])
+        if s["active"]:
+            schedule_chat(app, s["chat_id"])
     # в личке команд нет — бот работает только в группах и каналах
     await app.bot.delete_my_commands(scope=BotCommandScopeDefault())
     await app.bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
@@ -1409,9 +1497,6 @@ def main():
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
 
     commands = {
-        "settings": cmd_settings,
-        "settime": cmd_settime,
-        "setprompt": cmd_setprompt,
         "summary": cmd_summary,
         "menu": cmd_menu,
         "retry": cmd_retry,
