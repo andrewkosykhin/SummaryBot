@@ -166,6 +166,14 @@ def db():
             parent_id INTEGER
         )"""
     )
+    # сообщения других ботов, которые уже записали (через реплаи людей) — чтобы не дублировать
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS seen_bot_msgs (
+            chat_id INTEGER NOT NULL,
+            msg_id INTEGER NOT NULL,
+            PRIMARY KEY (chat_id, msg_id)
+        )"""
+    )
     # миграция: нераспознанное медиа (JSON) и id сообщения в Telegram — для /retry
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "media" not in cols:
@@ -208,6 +216,7 @@ def forget_chat(chat_id: int):
     with db() as conn:
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM summaries WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM seen_bot_msgs WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
 
@@ -589,6 +598,29 @@ def message_author(update: Update) -> str | None:
     return None
 
 
+def capture_bot_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram не присылает боту сообщения других ботов. Но если человек ответил
+    реплаем на сообщение бота — оно приходит внутри реплая, и его можно записать."""
+    msg = update.effective_message
+    target = msg.reply_to_message if msg else None
+    bot_user = target.from_user if target else None
+    if not bot_user or not bot_user.is_bot or bot_user.id == context.bot.id:
+        return
+    text = (target.text or target.caption or "").strip()
+    if not text:
+        return
+    chat_id = update.effective_chat.id
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO seen_bot_msgs (chat_id, msg_id) VALUES (?, ?)",
+            (chat_id, target.message_id),
+        )
+        if not cur.rowcount:
+            return  # уже записали по прошлому реплаю
+    name = bot_user.full_name + (f" (@{bot_user.username})" if bot_user.username else "")
+    save_message(chat_id, f"бот {name}", text, target.date, tg_msg_id=target.message_id)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -600,6 +632,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
+    capture_bot_reply(update, context)
     row_id = save_message(chat.id, author, msg.text, msg.date)
     urls = message_urls(msg)
     if urls:
@@ -964,6 +997,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
+    capture_bot_reply(update, context)
     if spec["kind"] == "image":
         got = await collect_photo(msg, spec, chat.id, author)
         if not got:
