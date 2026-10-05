@@ -12,6 +12,7 @@
 #   PHOTO_BATCH_WAIT   — необязательно, сек. тишины до разбора серии фото (по умолчанию 10)
 #   MAX_BATCH_PHOTOS   — необязательно, сколько фото из серии смотреть (по умолчанию 10)
 #   MAX_LINKS          — необязательно, сколько ссылок из сообщения описывать для саммари (по умолчанию 3)
+#   DB_PATH            — необязательно, путь к базе (по умолчанию /data/db.sql)
 #
 # Пример: docker run -d --env-file .env -v "$PWD/data:/data" summarybot
 # (папка data должна принадлежать uid 1000 — от него работает бот)
@@ -20,7 +21,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/messages.db
+    DB_PATH=/data/db.sql
 
 WORKDIR /app
 

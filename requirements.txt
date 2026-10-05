@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue]>=21,<23
-anthropic>=0.40
-openai>=1.40
-av>=12
-numpy>=1.26
+python-telegram-bot[job-queue]>=22.8,<23
+anthropic>=1.11,<2
+openai>=3.24,<4
+av>=19,<20
+numpy>=2.5,<3

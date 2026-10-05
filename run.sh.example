@@ -4,7 +4,10 @@ set -e
 cd "$(dirname "$0")"
 
 docker build -t summarybot:latest .
-docker rm -f summarybot 2>/dev/null || true
+# мягкая остановка: бот дорабатывает начатое (фото в ожидании пачки, запросы к ИИ).
+# docker kill / rm -f убивают сразу — и такие сообщения теряются
+docker stop -t 90 summarybot 2>/dev/null || true
+docker rm summarybot 2>/dev/null || true
 mkdir -p data && chown 1000:1000 data  # в контейнере бот работает от uid 1000
 docker run -d \
   --name summarybot \

@@ -3,7 +3,7 @@
 саммари. У каждого чата свой набор сообщений, свой промпт и своё время.
 
 Установка:
-    pip install "python-telegram-bot[job-queue]>=21" anthropic
+    pip install -r requirements.txt   (или Docker: см. run.sh.example)
 
 Переменные окружения:
     TELEGRAM_TOKEN      — токен бота от @BotFather
@@ -11,7 +11,7 @@
     SUMMARY_TIME        — время саммари по умолчанию для новых чатов (21:00)
     TZ_NAME             — часовой пояс для всех чатов (Europe/Moscow)
     MODEL               — модель, по умолчанию claude-sonnet-5-5
-    DB_PATH             — путь к базе, по умолчанию messages.db
+    DB_PATH             — путь к базе (в Docker по умолчанию /data/db.sql)
     VISION_MODEL        — модель для картинок, по умолчанию как MODEL
     FAST_MODEL          — модель для реакций на голосовые, по умолчанию claude-haiku-4-5
     OPENAI_API_KEY      — ключ OpenAI для расшифровки голосовых (без него не расшифровываем)
@@ -131,9 +131,12 @@ if MEMORY_DETAIL not in DETAIL_LIMITS:
 
 # ---------- база ----------
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+_schema_ready = False
+
+
+def _init_schema(conn: sqlite3.Connection):
+    """Таблицы и миграции — один раз на процесс, а не на каждый запрос."""
+    conn.execute("PRAGMA journal_mode=WAL")  # читатели не ждут писателя
     conn.execute(
         """CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,7 +188,25 @@ def db():
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
-    return conn
+
+
+@contextlib.contextmanager
+def db():
+    """Соединение с базой: коммит при успехе, откат при ошибке, всегда закрываем."""
+    global _schema_ready
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        if not _schema_ready:
+            _init_schema(conn)
+            _schema_ready = True
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def ensure_chat(chat_id: int, title: str | None) -> tuple[sqlite3.Row, bool]:
@@ -224,6 +245,25 @@ def wipe_chat_data(chat_id: int):
         conn.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM summaries WHERE chat_id = ?", (chat_id,))
         conn.execute("DELETE FROM seen_bot_msgs WHERE chat_id = ?", (chat_id,))
+
+
+def migrate_chat_id(old: int, new: int):
+    """Группа стала супергруппой — у чата новый id. Переносим всё на него.
+
+    Если под новым id уже что-то успело появиться, настройки берём старые
+    (их задавали люди), а сообщения и память объединяем.
+    """
+    with db() as conn:
+        old_row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (old,)).fetchone()
+        if not old_row:
+            return False
+        conn.execute("DELETE FROM chats WHERE chat_id = ?", (new,))
+        conn.execute("UPDATE chats SET chat_id = ? WHERE chat_id = ?", (new, old))
+        conn.execute("UPDATE messages SET chat_id = ? WHERE chat_id = ?", (new, old))
+        conn.execute("UPDATE summaries SET chat_id = ? WHERE chat_id = ?", (new, old))
+        conn.execute("UPDATE OR IGNORE seen_bot_msgs SET chat_id = ? WHERE chat_id = ?", (new, old))
+        conn.execute("DELETE FROM seen_bot_msgs WHERE chat_id = ?", (old,))
+    return True
 
 
 def save_message(
@@ -1146,6 +1186,23 @@ async def on_my_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("Бота убрали из чата %s, данные сохранены", chat.id)
 
 
+async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группу превратили в супергруппу: Telegram шлёт служебное сообщение в старый
+    чат (migrate_to_chat_id) и в новый (migrate_from_chat_id). Хватит любого."""
+    msg = update.effective_message
+    if msg.migrate_to_chat_id:
+        old, new = msg.chat.id, msg.migrate_to_chat_id
+    elif msg.migrate_from_chat_id:
+        old, new = msg.migrate_from_chat_id, msg.chat.id
+    else:
+        return
+    if migrate_chat_id(old, new):
+        unschedule_chat(context.application, old)
+        if get_chat(new)["active"]:
+            schedule_chat(context.application, new)
+        log.info("Чат %s стал супергруппой %s — данные перенесены", old, new)
+
+
 def apply_time(app: Application, chat_id: int, raw: str) -> str:
     m = TIME_RE.match(raw.strip())
     if not m:
@@ -1494,6 +1551,7 @@ def main():
     # block=False: распознавание долгое, не держим остальные апдейты
     app.add_handler(MessageHandler(chat_media, on_media, block=False))
     app.add_handler(ChatMemberHandler(on_my_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migrate))
     app.add_handler(CallbackQueryHandler(on_menu, pattern=r"^m:"))
 
     commands = {
