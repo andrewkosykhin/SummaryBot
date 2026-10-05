@@ -18,3 +18,7 @@ venv/
 
 # macOS
 .DS_Store
+
+# vim
+*.swp
+.*.sw?
