@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-06
+
 ### Изменено (несовместимо)
 - Переменные моделей получили префикс провайдера: `MODEL` → `ANTHROPIC_MODEL`,
   `VISION_MODEL` → `ANTHROPIC_VISION_MODEL`, `FAST_MODEL` → `ANTHROPIC_FAST_MODEL`,
@@ -19,7 +21,7 @@
 - «🗑 Удалить данные чата» в настройках `/menu`: стирает накопленные сообщения и всю память
   (с подтверждением), настройки остаются.
 - Переключатель «🔗 Пересказ ссылок» в настройках `/menu` (для каждого чата свой, по умолчанию
-  выкл): когда включён, бот отвечает на ссылку пересказом в стиле промпта чата и превью ссылки.
+  выкл): когда включён, бот отвечает реплаем на ссылку пересказом в стиле промпта чата.
   В саммари и память по-прежнему идёт нейтральная заметка.
 - Сообщения других ботов попадают в саммари, если кто-то ответил на них реплаем
   (Telegram не присылает ботам сообщения ботов напрямую). Каждое записывается один раз.
@@ -92,7 +94,8 @@
 - Сообщение в чат, когда у OpenAI или Anthropic кончился баланс (не чаще раза в 6 часов).
 - Индикатор «печатает…», пока бот думает.
 
-[Unreleased]: https://github.com/andrewkosykhin/SummaryBot/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/andrewkosykhin/SummaryBot/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/andrewkosykhin/SummaryBot/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/andrewkosykhin/SummaryBot/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/andrewkosykhin/SummaryBot/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/andrewkosykhin/SummaryBot/releases/tag/v0.1.0
