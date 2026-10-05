@@ -17,6 +17,10 @@
     OPENAI_API_KEY      — ключ OpenAI для расшифровки голосовых (без него не расшифровываем)
     STT_MODEL           — модель расшифровки, по умолчанию gpt-4o-transcribe
     MEMORY_DETAIL       — подробность памяти: short | normal | full (по умолчанию normal)
+    PHOTO_BATCH_WAIT    — сек. тишины после последнего фото автора, после которых серия
+                          фото разбирается одной пачкой (по умолчанию 10)
+    MAX_BATCH_PHOTOS    — сколько фото из серии смотреть (по умолчанию 10); альбом
+                          разбирается целиком
 
 ВАЖНО:
   * Группы: в @BotFather выполни /setprivacy -> Disable, иначе бот видит
@@ -81,6 +85,8 @@ MODEL = os.getenv("MODEL", "claude-sonnet-5-5")
 VISION_MODEL = os.getenv("VISION_MODEL", MODEL)
 FAST_MODEL = os.getenv("FAST_MODEL", "claude-haiku-4-5")
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+PHOTO_BATCH_WAIT = float(os.getenv("PHOTO_BATCH_WAIT", "10"))
+MAX_BATCH_PHOTOS = max(1, int(os.getenv("MAX_BATCH_PHOTOS", "10")))
 DB_PATH = os.getenv("DB_PATH", "messages.db")
 
 MAX_TRANSCRIPT_CHARS = 150_000  # чтобы не улететь в лимиты модели
@@ -594,33 +600,42 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024  # лимит Claude на картинку
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # больше Bot API не отдаёт
 
 
-async def describe_image(data: bytes, media_type: str, prompt: str, caption: str) -> str:
-    ask = (
-        "Это картинка из чата. Опиши в 1–3 предложениях, что на ней: что изображено, "
-        "текст на картинке, если это мем — в чём шутка. Добавь пару подходящих эмодзи. "
-        "Описание пойдёт в дневное саммари."
-    )
+async def describe_images(
+    images: list[tuple[bytes, str]], prompt: str, caption: str, total: int
+) -> str:
+    """Описывает одну картинку или пачку целиком, одним запросом."""
+    if len(images) == 1:
+        ask = (
+            "Это картинка из чата. Опиши в 1–3 предложениях, что на ней: что изображено, "
+            "текст на картинке, если это мем — в чём шутка."
+        )
+    else:
+        ask = (
+            f"Это {len(images)} картинок, которые человек отправил в чат подряд"
+            + (f" (из {total}, остальные не показаны)" if total > len(images) else "")
+            + ". Разбери их вместе, как одну историю: что на них, что их связывает, "
+            "текст на картинках, если это мемы — в чём шутка. 2–5 предложений."
+        )
+    ask += " Добавь пару подходящих эмодзи. Описание пойдёт в дневное саммари."
     if caption:
-        ask += f"\nПодпись к картинке: {caption}"
+        ask += f"\nПодпись: {caption}"
+    content = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64.standard_b64encode(data).decode(),
+            },
+        }
+        for data, media_type in images
+    ]
     resp = await ai.messages.create(
         model=VISION_MODEL,
         max_tokens=4000,  # с запасом: часть уходит на размышления модели
         output_config={"effort": "low"},
         system=prompt,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": base64.standard_b64encode(data).decode(),
-                    },
-                },
-                {"type": "text", "text": ask},
-            ],
-        }],
+        messages=[{"role": "user", "content": content + [{"type": "text", "text": ask}]}],
     )
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
@@ -713,11 +728,11 @@ def media_spec(msg) -> dict | None:
         # самый крупный вариант не больше ~1600px — Claude всё равно ужмёт
         fit = [p for p in msg.photo if max(p.width, p.height) <= 1600] or msg.photo[:1]
         p = fit[-1]
-        return spec | {"kind": "image", "file_id": p.file_id,
+        return spec | {"kind": "image", "file_id": p.file_id, "group": msg.media_group_id,
                        "media_type": "image/jpeg", "size": p.file_size}
     if msg.document and msg.document.mime_type in IMAGE_TYPES:
         d = msg.document
-        return spec | {"kind": "image", "file_id": d.file_id,
+        return spec | {"kind": "image", "file_id": d.file_id, "group": msg.media_group_id,
                        "media_type": d.mime_type, "size": d.file_size}
     audio = msg.voice or msg.video_note
     if audio:
@@ -746,18 +761,27 @@ async def process_media(
     if kind == "sticker":
         return f"[стикер {spec['emoji']}]".replace(" ]", "]"), None, False
 
-    if kind == "image":
-        if spec["size"] and spec["size"] > MAX_IMAGE_BYTES:
-            return f"[картинка, слишком большая]{tail}", None, False
+    if kind in ("image", "batch"):
+        parts = spec["items"] if kind == "batch" else [spec]
+        total = len(parts)
+        parts = [p for p in parts if not (p["size"] and p["size"] > MAX_IMAGE_BYTES)]
+        if not spec.get("album"):  # альбом смотрим целиком, серию — до лимита
+            parts = parts[:MAX_BATCH_PHOTOS]
+        what = "картинка" if total == 1 else f"{total} фото"
+        if not parts:
+            return f"[{what}, слишком большие]{tail}", None, False
+        seen = f", смотрел {len(parts)} из {total}" if len(parts) < total else ""
         try:
-            f = await context.bot.get_file(spec["file_id"])
-            data = bytes(await f.download_as_bytearray())
-            desc = await describe_image(data, spec["media_type"], prompt, caption)
-            return f"[картинка: {desc}]{tail}", f"🖼 {desc}", False
+            images = []
+            for p in parts:
+                f = await context.bot.get_file(p["file_id"])
+                images.append((bytes(await f.download_as_bytearray()), p["media_type"]))
+            desc = await describe_images(images, prompt, caption, total)
+            return f"[{what}{seen}: {desc}]{tail}", f"🖼 {desc}", False
         except Exception as e:
-            log.exception("Не смог описать картинку в чате %s", chat_id)
+            log.exception("Не смог описать картинки в чате %s", chat_id)
             notice = quota_notice(chat_id, e, "смотреть картинки", always_notify)
-            return f"[картинка]{tail}", notice, True
+            return f"[{what}]{tail}", notice, True
 
     label = "голосовое" if kind == "voice" else "кружочек"
     head = f"[{label} {fmt_duration(spec['duration'])}"
@@ -806,6 +830,41 @@ async def send_reply(bot: Bot, chat_id: int, reply_to: int | None, text: str):
         log.info("Не смог ответить в %s (нет прав писать?)", chat_id)
 
 
+# фото, которые автор ещё досылает: (chat_id, автор) -> {"msgs": [...], "seq": n}
+_photo_batches: dict[tuple[int, str], dict] = {}
+
+
+async def collect_photo(msg, spec: dict, chat_id: int, author: str) -> tuple | None:
+    """Копит фото автора, пока он шлёт их (альбомом или по одной).
+
+    Каждое новое фото продлевает ожидание на PHOTO_BATCH_WAIT. Пачку получает
+    тот вызов, после которого новых фото не пришло, — остальные возвращают None.
+    """
+    key = (chat_id, author)
+    batch = _photo_batches.setdefault(key, {"msgs": [], "seq": 0})
+    batch["msgs"].append((msg, spec))
+    batch["seq"] += 1
+    my = batch["seq"]
+    await asyncio.sleep(PHOTO_BATCH_WAIT)
+    if _photo_batches.get(key) is not batch or batch["seq"] != my:
+        return None  # пришли ещё фото — пачку заберёт последний
+    del _photo_batches[key]
+    msgs = sorted(batch["msgs"], key=lambda x: x[0].message_id)
+    if len(msgs) == 1:
+        return msgs[0]
+    specs = [sp for _, sp in msgs]
+    groups = {sp.get("group") for sp in specs}
+    batch_spec = {
+        "kind": "batch",
+        "caption": " / ".join(sp["caption"] for sp in specs if sp["caption"]),
+        "items": specs,
+        "album": len(groups) == 1 and None not in groups,  # один альбом — смотрим все
+    }
+    log.info("Чат %s: пачка из %d фото от %s%s", chat_id, len(msgs), author,
+             " (альбом)" if batch_spec["album"] else "")
+    return msgs[0][0], batch_spec
+
+
 async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat = update.effective_chat
@@ -816,6 +875,11 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s, created = ensure_chat(chat.id, chat.title)
     if created:
         schedule_chat(context.application, chat.id)
+    if spec["kind"] == "image":
+        got = await collect_photo(msg, spec, chat.id, author)
+        if not got:
+            return
+        msg, spec = got  # дальше работаем с первым сообщением пачки
     # стикеры обрабатываются мгновенно — им «печатает…» не нужен
     quiet = spec["kind"] == "sticker"
     async with (contextlib.nullcontext() if quiet else typing(context.bot, chat.id)):
@@ -996,10 +1060,6 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(context.bot, chat.id, f"🧠 Что я помню:\n\n{text}")
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(__doc__.split("Команды в чате")[1].strip(" :\n"))
-
-
 # ---------- меню на кнопках ----------
 
 TIME_PRESETS = ["09:00", "12:00", "15:00", "18:00", "20:00", "21:00", "22:00", "23:00"]
@@ -1123,16 +1183,14 @@ GROUP_COMMANDS = [
     BotCommand("stats", "Сколько сообщений накоплено"),
     BotCommand("memory", "Что бот помнит о чате"),
     BotCommand("retry", "Перераспознать голосовые/картинки"),
-    BotCommand("help", "Справка"),
 ]
 
 
 async def post_init(app: Application):
     for s in all_chats():
         schedule_chat(app, s["chat_id"])
-    await app.bot.set_my_commands(
-        [BotCommand("help", "Справка")], scope=BotCommandScopeDefault()
-    )
+    # в личке команд нет — бот работает только в группах и каналах
+    await app.bot.delete_my_commands(scope=BotCommandScopeDefault())
     await app.bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
     # убираем старый админский скоуп, он перекрывал бы групповой
     await app.bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
@@ -1172,11 +1230,10 @@ def main():
         "setprompt": cmd_setprompt,
         "summary": cmd_summary,
         "stats": cmd_stats,
-        "help": cmd_help,
         "menu": cmd_menu,
         "retry": cmd_retry,
         "memory": cmd_memory,
-        "start": cmd_help,
+        "start": cmd_menu,  # кнопка Start: в группе — меню, в личке — «добавь в группу»
     }
     for name, handler in commands.items():
         app.add_handler(CommandHandler(name, handler, filters=new_posts))
