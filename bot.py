@@ -202,6 +202,11 @@ def _init_schema(conn: sqlite3.Connection):
     chat_cols = {r["name"] for r in conn.execute("PRAGMA table_info(chats)")}
     if "link_replies" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN link_replies INTEGER NOT NULL DEFAULT 0")
+    # миграция: отвечать ли в чат на картинки и стикеры (по умолчанию вкл — как раньше)
+    if "image_replies" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN image_replies INTEGER NOT NULL DEFAULT 1")
+    if "sticker_replies" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN sticker_replies INTEGER NOT NULL DEFAULT 1")
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -246,7 +251,7 @@ def get_chat(chat_id: int) -> sqlite3.Row | None:
 
 
 def update_chat(chat_id: int, field: str, value):
-    assert field in ("summary_time", "prompt", "title", "link_replies", "active")
+    assert field in ("summary_time", "prompt", "title", "active", *TOGGLE_FIELDS)
     with db() as conn:
         conn.execute(f"UPDATE chats SET {field} = ? WHERE chat_id = ?", (value, chat_id))
 
@@ -1148,6 +1153,7 @@ async def process_media(
     caption = spec["caption"]
     tail = f" | подпись: {caption}" if caption else ""
     kind = spec["kind"]
+    s = get_chat(chat_id)
 
     if kind == "sticker":
         head = f"[стикер {spec['emoji']}".rstrip()
@@ -1167,6 +1173,8 @@ async def process_media(
                 log.exception("Не смог прочитать стикер в чате %s", chat_id)
                 desc = ""
         text = f"{head}: {desc}]" if desc else f"{head}]"
+        if not (s and s["sticker_replies"]):
+            return text, None, False  # реакция выключена — в чат молчим, запрос не тратим
         try:
             reply = await react_to_sticker(desc, spec["emoji"], prompt, author) or None
         except Exception as e:
@@ -1190,8 +1198,9 @@ async def process_media(
                 f = await context.bot.get_file(p["file_id"])
                 images.append((bytes(await f.download_as_bytearray()), p["media_type"]))
             desc = await describe_images(images, prompt, caption, total)
-            # в базу — нейтральное описание, в чат — реакция в стиле промпта
-            return f"[{what}{seen}: {desc['facts']}]{tail}", f"🖼 {desc['post']}", False
+            # в базу — нейтральное описание, в чат — реакция в стиле промпта (если включена)
+            reply = f"🖼 {desc['post']}" if s and s["image_replies"] else None
+            return f"[{what}{seen}: {desc['facts']}]{tail}", reply, False
         except Exception as e:
             log.exception("Не смог описать картинки в чате %s", chat_id)
             notice = quota_notice(chat_id, e, "смотреть картинки", always_notify)
@@ -1521,6 +1530,15 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 TIME_PRESETS = ["09:00", "12:00", "15:00", "18:00", "20:00", "21:00", "22:00", "23:00"]
 
 
+# переключатели в настройках: ключ в callback -> (колонка в chats, подпись)
+TOGGLES = {
+    "links": ("link_replies", "🔗 Пересказ ссылок"),
+    "images": ("image_replies", "🖼 Реакция на картинки"),
+    "stickers": ("sticker_replies", "🎭 Реакция на стикеры"),
+}
+TOGGLE_FIELDS = tuple(field for field, _ in TOGGLES.values())
+
+
 # сообщения-запросы бота: ответ на них реплаем меняет настройку
 ASK_TIME = "ответь реплаем на это сообщение временем саммари в формате ЧЧ:ММ, например 21:30."
 ASK_PROMPT = "ответь реплаем на это сообщение текстом нового промпта для саммари."
@@ -1559,23 +1577,30 @@ def menu_kb() -> InlineKeyboardMarkup:
 def settings_text(chat_id: int) -> str:
     s = get_chat(chat_id)
     kind = "свой" if s["prompt"] else "по умолчанию"
+    toggles = "\n".join(
+        f"{label}: {'вкл' if s[field] else 'выкл'}" for field, label in TOGGLES.values()
+    )
     return (
         "⚙️ Настройки чата\n"
         f"⏰ Саммари каждый день в {s['summary_time']}\n"
         f"📝 Промпт: {kind}\n"
-        f"🔗 Пересказ ссылок в чат: {'вкл' if s['link_replies'] else 'выкл'}"
+        f"{toggles}"
     )
 
 
 def settings_kb(chat_id: int) -> InlineKeyboardMarkup:
     s = get_chat(chat_id)
-    state = "вкл ✅" if s["link_replies"] else "выкл"
+    toggles = [
+        [InlineKeyboardButton(f"{label}: {'вкл ✅' if s[field] else 'выкл'}",
+                              callback_data=f"m:toggle:{key}")]
+        for key, (field, label) in TOGGLES.items()
+    ]
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⏰ Время", callback_data="m:time"),
             InlineKeyboardButton("📝 Промпт", callback_data="m:prompt"),
         ],
-        [InlineKeyboardButton(f"🔗 Пересказ ссылок: {state}", callback_data="m:links")],
+        *toggles,
         [InlineKeyboardButton("🗑 Удалить данные чата", callback_data="m:wipe")],
         [InlineKeyboardButton("◀️ Назад", callback_data="m:home")],
     ])
@@ -1695,10 +1720,11 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_chat(chat.id, "prompt", None)
             await q.answer("Промпт сброшен")
             await show(settings_text(chat.id), settings_kb(chat.id))
-        case ["links"]:
-            on = 0 if get_chat(chat.id)["link_replies"] else 1
-            update_chat(chat.id, "link_replies", on)
-            await q.answer("Пересказ ссылок включён" if on else "Пересказ ссылок выключен")
+        case ["toggle", key] | ["links" as key] if key in TOGGLES:  # links — старые кнопки
+            field, label = TOGGLES[key]
+            on = 0 if get_chat(chat.id)[field] else 1
+            update_chat(chat.id, field, on)
+            await q.answer(f"{label}: {'вкл' if on else 'выкл'}")
             await show(settings_text(chat.id), settings_kb(chat.id))
         case ["wipe"]:
             await q.answer()
