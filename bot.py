@@ -45,6 +45,7 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import html
 import io
 import json
 import logging
@@ -66,7 +67,6 @@ from telegram import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeDefault,
     InlineKeyboardButton,
-    ForceReply,
     InlineKeyboardMarkup,
     MessageEntity,
     Update,
@@ -1428,8 +1428,26 @@ TIME_PRESETS = ["09:00", "12:00", "15:00", "18:00", "20:00", "21:00", "22:00", "
 
 
 # сообщения-запросы бота: ответ на них реплаем меняет настройку
-ASK_TIME = "⏰ Ответь на это сообщение временем саммари в формате ЧЧ:ММ, например 21:30."
-ASK_PROMPT = "📝 Ответь на это сообщение текстом нового промпта для саммари."
+ASK_TIME = "ответь реплаем на это сообщение временем саммари в формате ЧЧ:ММ, например 21:30."
+ASK_PROMPT = "ответь реплаем на это сообщение текстом нового промпта для саммари."
+ASK_TTL = 600  # через 10 минут без ответа запрос удаляется
+
+
+async def ask_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user, icon: str, ask: str):
+    """Просит нажавшего кнопку ответить реплаем — обычным сообщением с упоминанием.
+
+    ForceReply сознательно не используем: в группе он открывает поле реплая у всех,
+    кто заходит в чат, и мешает общаться.
+    """
+    who = f'<a href="tg://user?id={user.id}">{html.escape(user.first_name or "ты")}</a>'
+    sent = await context.bot.send_message(chat_id, f"{icon} {who}, {ask}", parse_mode="HTML")
+
+    async def expire():
+        await asyncio.sleep(ASK_TTL)
+        with contextlib.suppress(Exception):  # уже удалили после ответа — и ладно
+            await sent.delete()
+
+    context.application.create_task(expire())
 
 
 def menu_text(chat_id: int) -> str:
@@ -1520,12 +1538,15 @@ async def on_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not target or not target.from_user or target.from_user.id != context.bot.id:
         return False
     chat_id = update.effective_chat.id
-    if target.text == ASK_TIME:
+    asked = target.text or ""
+    if ASK_TIME in asked:
         await msg.reply_text(apply_time(context.application, chat_id, msg.text))
-    elif target.text == ASK_PROMPT:
+    elif ASK_PROMPT in asked:
         await msg.reply_text(apply_prompt(chat_id, msg.text))
     else:
         return False
+    with contextlib.suppress(Exception):  # запрос больше не нужен — убираем из чата
+        await target.delete()
     return True
 
 
@@ -1565,9 +1586,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show(settings_text(chat.id), settings_kb(chat.id))
         case ["asktime"]:
             await q.answer()
-            await context.bot.send_message(
-                chat.id, ASK_TIME, reply_markup=ForceReply(input_field_placeholder="21:30")
-            )
+            await ask_user(context, chat.id, q.from_user, "⏰", ASK_TIME)
         case ["prompt"]:
             await q.answer()
             s = get_chat(chat.id)
@@ -1578,7 +1597,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show(f"📝 Промпт ({kind}):\n{prompt}", prompt_kb(bool(s["prompt"])))
         case ["askprompt"]:
             await q.answer()
-            await context.bot.send_message(chat.id, ASK_PROMPT, reply_markup=ForceReply())
+            await ask_user(context, chat.id, q.from_user, "📝", ASK_PROMPT)
         case ["resetprompt"]:
             update_chat(chat.id, "prompt", None)
             await q.answer("Промпт сброшен")
