@@ -207,6 +207,8 @@ def _init_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE chats ADD COLUMN image_replies INTEGER NOT NULL DEFAULT 1")
     if "sticker_replies" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN sticker_replies INTEGER NOT NULL DEFAULT 1")
+    if "voice_replies" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN voice_replies INTEGER NOT NULL DEFAULT 1")
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -1234,6 +1236,8 @@ async def process_media(
     if gender:
         head += f", {gender} голос"
     reply = None  # в чат — только реакция, расшифровка идёт лишь в базу
+    if not (s and s["voice_replies"]):
+        return f"{head}: {text}]{tail}", None, False  # реакция выключена — запрос не тратим
     try:
         reply = await react_to_voice(text, prompt, author, gender) or None
     except Exception as e:
@@ -1535,6 +1539,7 @@ TOGGLES = {
     "links": ("link_replies", "🔗 Пересказ ссылок"),
     "images": ("image_replies", "🖼 Реакция на картинки"),
     "stickers": ("sticker_replies", "🎭 Реакция на стикеры"),
+    "voices": ("voice_replies", "🎙 Реакция на голосовые"),
 }
 TOGGLE_FIELDS = tuple(field for field, _ in TOGGLES.values())
 
