@@ -209,6 +209,8 @@ def _init_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE chats ADD COLUMN sticker_replies INTEGER NOT NULL DEFAULT 1")
     if "voice_replies" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN voice_replies INTEGER NOT NULL DEFAULT 1")
+    if "dialog_replies" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN dialog_replies INTEGER NOT NULL DEFAULT 1")
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -811,12 +813,71 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     capture_bot_reply(update, context)
     row_id = save_message(chat.id, author, msg.text, msg.date)
     context.application.create_task(maybe_compact_day(chat.id))
+    target = replied_to_bot(msg, context.bot.id)
+    s = get_chat(chat.id)
+    if target and s["dialog_replies"]:
+        context.application.create_task(answer_reply(
+            context.bot, chat.id, msg, target.text or target.caption, author
+        ))
     urls = message_urls(msg)
     if urls:
         # открываем ссылки фоном, чтобы не держать остальные апдейты
         context.application.create_task(
             enrich_links(row_id, urls, chat.id, context.bot, msg.message_id)
         )
+
+
+# ---------- ответы на реплаи боту ----------
+
+DIALOG_CONTEXT_MESSAGES = 15  # сколько последних сообщений чата показать модели для контекста
+DIALOG_BOT_TEXT_CHARS = 3000  # длинные итоги дня режем — для ответа хватит начала
+
+
+def replied_to_bot(msg, bot_id: int):
+    """Сообщение бота, на которое ответили реплаем, — если это не меню и не служебный запрос."""
+    target = msg.reply_to_message
+    if not target or not target.from_user or target.from_user.id != bot_id:
+        return None
+    if target.reply_markup:  # меню с кнопками — не разговор
+        return None
+    text = target.text or target.caption or ""
+    if not text or ASK_TIME in text or ASK_PROMPT in text:
+        return None
+    return target
+
+
+async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
+    """Человек ответил боту реплаем — отвечаем ему в стиле промпта чата."""
+    s = get_chat(chat_id)
+    recent = fetch_messages(chat_id)[-DIALOG_CONTEXT_MESSAGES:]
+    context_lines = build_transcript(recent) if recent else "—"
+    if len(bot_text) > DIALOG_BOT_TEXT_CHARS:
+        bot_text = bot_text[:DIALOG_BOT_TEXT_CHARS] + "…"
+    try:
+        async with typing(bot, chat_id):
+            resp = await ai.messages.create(
+                model=MODEL,
+                max_tokens=4000,
+                system=f"{s['prompt'] or DEFAULT_PROMPT}\n\n{PLAIN_TEXT}",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Последние сообщения в чате для контекста:\n{context_lines}\n\n---\n\n"
+                        f"Ты раньше написал в чат:\n{bot_text}\n\n"
+                        f"{author} ответил тебе на это реплаем:\n{msg.text}\n\n"
+                        "Ответь ему коротко, 1–3 предложения, в своём стиле. Добавь пару "
+                        "подходящих эмодзи."
+                    ),
+                }],
+            )
+        if resp.stop_reason == "refusal":
+            return
+        text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as e:
+        log.exception("Не смог ответить на реплай в чате %s", chat_id)
+        text = quota_notice(chat_id, e, "отвечать на реплаи")
+    if text:
+        await send_reply(bot, chat_id, msg.message_id, text)
 
 
 # ---------- ссылки ----------
@@ -1540,6 +1601,7 @@ TOGGLES = {
     "images": ("image_replies", "🖼 Реакция на картинки"),
     "stickers": ("sticker_replies", "🎭 Реакция на стикеры"),
     "voices": ("voice_replies", "🎙 Реакция на голосовые"),
+    "dialog": ("dialog_replies", "💬 Ответы на реплаи"),
 }
 TOGGLE_FIELDS = tuple(field for field, _ in TOGGLES.values())
 
