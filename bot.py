@@ -186,6 +186,13 @@ def _init_schema(conn: sqlite3.Connection):
             PRIMARY KEY (chat_id, msg_id)
         )"""
     )
+    # что написано и нарисовано на стикере: стикеры повторяются, читаем каждый один раз
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS sticker_cache (
+            file_unique_id TEXT PRIMARY KEY,
+            description TEXT NOT NULL
+        )"""
+    )
     # миграция: нераспознанное медиа (JSON) и id сообщения в Telegram — для /retry
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
     if "media" not in cols:
@@ -904,6 +911,68 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024  # лимит Claude на картинку
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # больше Bot API не отдаёт
 
 
+def image_type(data: bytes) -> str | None:
+    """Формат картинки по сигнатуре — у превью стикеров он не указан."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return None
+
+
+def cached_sticker(unique_id: str) -> str | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT description FROM sticker_cache WHERE file_unique_id = ?", (unique_id,)
+        ).fetchone()
+    return row["description"] if row else None
+
+
+def cache_sticker(unique_id: str, description: str):
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO sticker_cache (file_unique_id, description) VALUES (?, ?)",
+            (unique_id, description),
+        )
+
+
+async def describe_sticker(data: bytes, media_type: str) -> str:
+    """Что на стикере: текст дословно + пара слов о картинке. Нейтрально, для саммари."""
+    resp = await ai.messages.create(
+        model=FAST_MODEL,
+        max_tokens=300,
+        system=(
+            "Это стикер из Telegram. Если на нём есть текст — перепиши его дословно в "
+            "кавычках «…», потом через тире 3–8 слов, что нарисовано. Если текста нет — "
+            "только 3–8 слов, что нарисовано. Без оценок и пояснений, одна строка."
+        ),
+        messages=[{"role": "user", "content": [{
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type,
+                       "data": base64.standard_b64encode(data).decode()},
+        }]}],
+    )
+    return " ".join("".join(b.text for b in resp.content if b.type == "text").split())
+
+
+async def react_to_sticker(desc: str, emoji: str, prompt: str, author: str) -> str:
+    """Реакция на стикер в стиле промпта чата — для ответа в чат, в базу не идёт."""
+    resp = await ai.messages.create(
+        model=FAST_MODEL,
+        max_tokens=400,
+        system=f"{prompt}\n\n{PLAIN_TEXT}",
+        messages=[{
+            "role": "user",
+            "content": f"{author} кинул в чат стикер {emoji}. На нём: {desc or 'без текста'}. "
+            "Отреагируй одним-двумя короткими предложениями, подхвати шутку или текст "
+            "стикера. Добавь пару подходящих эмодзи.",
+        }],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
 async def describe_images(
     images: list[tuple[bytes, str]], prompt: str, caption: str, total: int
 ) -> dict:
@@ -1040,7 +1109,12 @@ def media_spec(msg) -> dict | None:
     """Что за медиа в сообщении — в виде, который можно сохранить и перепрогнать."""
     spec = {"caption": (msg.caption or "").strip()}
     if msg.sticker:
-        return spec | {"kind": "sticker", "emoji": msg.sticker.emoji or ""}
+        st = msg.sticker
+        # анимированные (TGS — векторы) и видео (WEBM) не прочитать — берём их превью
+        pic = st if not (st.is_animated or st.is_video) else st.thumbnail
+        return spec | {"kind": "sticker", "emoji": st.emoji or "",
+                       "file_id": pic.file_id if pic else None,
+                       "unique_id": st.file_unique_id}
     if msg.photo:
         # самый крупный вариант не больше ~1600px — Claude всё равно ужмёт
         fit = [p for p in msg.photo if max(p.width, p.height) <= 1600] or msg.photo[:1]
@@ -1076,7 +1150,29 @@ async def process_media(
     kind = spec["kind"]
 
     if kind == "sticker":
-        return f"[стикер {spec['emoji']}]".replace(" ]", "]"), None, False
+        head = f"[стикер {spec['emoji']}".rstrip()
+        unique_id, file_id = spec.get("unique_id"), spec.get("file_id")
+        if not unique_id or not file_id:
+            return f"{head}]", None, False
+        desc = cached_sticker(unique_id)
+        if desc is None:
+            try:
+                f = await context.bot.get_file(file_id)
+                data = bytes(await f.download_as_bytearray())
+                media_type = image_type(data)
+                desc = await describe_sticker(data, media_type) if media_type else ""
+                cache_sticker(unique_id, desc)
+            except Exception:
+                # стикер — не та потеря, ради которой стоит ретраить; в саммари уйдёт эмодзи
+                log.exception("Не смог прочитать стикер в чате %s", chat_id)
+                desc = ""
+        text = f"{head}: {desc}]" if desc else f"{head}]"
+        try:
+            reply = await react_to_sticker(desc, spec["emoji"], prompt, author) or None
+        except Exception as e:
+            log.exception("Не смог отреагировать на стикер в чате %s", chat_id)
+            reply = quota_notice(chat_id, e, "отвечать на стикеры", always_notify)
+        return text, reply, False
 
     if kind in ("image", "batch"):
         parts = spec["items"] if kind == "batch" else [spec]
@@ -1200,9 +1296,7 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not got:
             return
         msg, spec = got  # дальше работаем с первым сообщением пачки
-    # стикеры обрабатываются мгновенно — им «печатает…» не нужен
-    quiet = spec["kind"] == "sticker"
-    async with (contextlib.nullcontext() if quiet else typing(context.bot, chat.id)):
+    async with typing(context.bot, chat.id):
         text, reply, retry = await process_media(
             spec, context, s["prompt"] or DEFAULT_PROMPT, chat.id, author
         )
