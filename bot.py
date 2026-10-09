@@ -1590,9 +1590,8 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         case ["prompt"]:
             await q.answer()
             s = get_chat(chat.id)
+            # промпт ≤ MAX_PROMPT_CHARS (4000) + заголовок — влезает в лимит Telegram (4096)
             prompt = s["prompt"] or DEFAULT_PROMPT
-            if len(prompt) > 1000:
-                prompt = prompt[:1000] + "…"
             kind = "свой" if s["prompt"] else "по умолчанию"
             await show(f"📝 Промпт ({kind}):\n{prompt}", prompt_kb(bool(s["prompt"])))
         case ["askprompt"]:
