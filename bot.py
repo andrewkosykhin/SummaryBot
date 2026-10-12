@@ -46,6 +46,7 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import hashlib
 import html
 import io
 import json
@@ -222,6 +223,11 @@ def _init_schema(conn: sqlite3.Connection):
     # сколько последних сообщений чата бот видит, отвечая на реплай
     if "dialog_context" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN dialog_context INTEGER NOT NULL DEFAULT 100")
+    # имя бота из промпта: само имя, его формы (JSON) и хэш промпта, из которого их взяли
+    if "bot_name" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN bot_name TEXT")
+        conn.execute("ALTER TABLE chats ADD COLUMN bot_name_forms TEXT")
+        conn.execute("ALTER TABLE chats ADD COLUMN bot_name_of TEXT")
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -266,7 +272,8 @@ def get_chat(chat_id: int) -> sqlite3.Row | None:
 
 
 def update_chat(chat_id: int, field: str, value):
-    assert field in ("summary_time", "prompt", "title", "active", "dialog_context", *TOGGLE_FIELDS)
+    assert field in ("summary_time", "prompt", "title", "active", "dialog_context",
+                     "bot_name", "bot_name_forms", "bot_name_of", *TOGGLE_FIELDS)
     with db() as conn:
         conn.execute(f"UPDATE chats SET {field} = ? WHERE chat_id = ?", (value, chat_id))
 
@@ -826,16 +833,106 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.application.create_task(maybe_compact_day(chat.id))
     target = replied_to_bot(msg, context.bot.id)
     s = get_chat(chat.id)
-    if target and s["dialog_replies"]:
-        context.application.create_task(answer_reply(
-            context.bot, chat.id, msg, target.text or target.caption, author
-        ))
+    if s["dialog_replies"]:
+        if target:
+            bot_text = target.text or target.caption
+        elif mentioned_bot(msg, context.bot.id) or called_by_name(msg.text, s["bot_name_forms"]):
+            bot_text = None  # обратились по имени или @username
+        else:
+            bot_text = False
+        if bot_text is not False:
+            context.application.create_task(
+                answer_reply(context.bot, chat.id, msg, bot_text, author)
+            )
     urls = message_urls(msg)
     if urls:
         # открываем ссылки фоном, чтобы не держать остальные апдейты
         context.application.create_task(
             enrich_links(row_id, urls, chat.id, context.bot, msg.message_id)
         )
+
+
+# ---------- имя бота и обращения к нему ----------
+
+BOT_USERNAME = ""  # заполняется в post_init из getMe
+
+NAME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "forms": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["name", "forms"],
+    "additionalProperties": False,
+}
+
+
+def prompt_hash(prompt: str) -> str:
+    return hashlib.sha1(prompt.encode()).hexdigest()
+
+
+async def extract_bot_name(prompt: str) -> tuple[str, list[str]]:
+    """Имя персонажа из промпта и его формы, как к нему обращаются. ('', []) — имени нет."""
+    resp = await ai.messages.create(
+        model=FAST_MODEL,
+        max_tokens=500,
+        system=(
+            "Тебе дают промпт, который задаёт персонажа чат-бота. Если в нём явно указано "
+            "имя персонажа — верни его в name, а в forms — как к нему могут обращаться в "
+            "чате: само имя, падежные формы, уменьшительные и звательные (например, для "
+            "«Санёк»: Санёк, Санька, Саньку, Саньке, Саньком, Саня, Сань). Если имени нет "
+            "(только роль вроде «гопник» или «пират») — name пустой, forms пустой."
+        ),
+        messages=[{"role": "user", "content": prompt}],
+        output_config={"format": {"type": "json_schema", "schema": NAME_SCHEMA}},
+    )
+    data = json.loads(next(b.text for b in resp.content if b.type == "text"))
+    name = data["name"].strip()
+    forms = sorted({f.strip() for f in data["forms"] + [name] if f.strip()}) if name else []
+    return name, forms
+
+
+async def refresh_bot_name(chat_id: int):
+    """Обновляет имя бота, если промпт чата поменялся с прошлого раза."""
+    s = get_chat(chat_id)
+    if not s:
+        return
+    prompt = s["prompt"] or DEFAULT_PROMPT
+    h = prompt_hash(prompt)
+    if s["bot_name_of"] == h:
+        return
+    try:
+        name, forms = await extract_bot_name(prompt)
+    except Exception:
+        log.exception("Не смог достать имя бота из промпта чата %s", chat_id)
+        return  # попробуем при следующей смене промпта или рестарте
+    update_chat(chat_id, "bot_name", name or None)
+    update_chat(chat_id, "bot_name_forms", json.dumps(forms, ensure_ascii=False) if forms else None)
+    update_chat(chat_id, "bot_name_of", h)
+    log.info("Чат %s: имя бота из промпта — %s", chat_id, name or "нет")
+
+
+def _norm(text: str) -> str:
+    return text.lower().replace("ё", "е")
+
+
+def called_by_name(text: str, forms_json: str | None) -> bool:
+    """Обратились ли к боту по имени — целым словом, в любой из форм."""
+    if not forms_json:
+        return False
+    forms = [_norm(f) for f in json.loads(forms_json)]
+    pattern = r"(?<!\w)(" + "|".join(re.escape(f) for f in forms) + r")(?!\w)"
+    return bool(re.search(pattern, _norm(text)))
+
+
+def mentioned_bot(msg, bot_id: int) -> bool:
+    """@username бота или упоминание-ссылка на него."""
+    for ent, text in msg.parse_entities([MessageEntity.MENTION, MessageEntity.TEXT_MENTION]).items():
+        if ent.type == MessageEntity.TEXT_MENTION and ent.user and ent.user.id == bot_id:
+            return True
+        if BOT_USERNAME and text.lower() == f"@{BOT_USERNAME.lower()}":
+            return True
+    return False
 
 
 # ---------- ответы на реплаи боту ----------
@@ -859,13 +956,19 @@ def replied_to_bot(msg, bot_id: int):
     return target
 
 
-async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
-    """Человек ответил боту реплаем — отвечаем ему в стиле промпта чата."""
+async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str | None, author: str):
+    """Человек ответил боту реплаем (bot_text — на что) или обратился к нему по имени или
+    @username (bot_text=None) — отвечаем в стиле промпта чата."""
     s = get_chat(chat_id)
     recent = fetch_messages(chat_id)[-s["dialog_context"]:]
     context_lines = build_transcript(recent) if recent else "—"
-    if len(bot_text) > DIALOG_BOT_TEXT_CHARS:
-        bot_text = bot_text[:DIALOG_BOT_TEXT_CHARS] + "…"
+    if bot_text is None:
+        situation = f"{author} обратился к тебе в чате:\n{msg.text}"
+    else:
+        if len(bot_text) > DIALOG_BOT_TEXT_CHARS:
+            bot_text = bot_text[:DIALOG_BOT_TEXT_CHARS] + "…"
+        situation = (f"Ты раньше написал в чат:\n{bot_text}\n\n"
+                     f"{author} ответил тебе на это реплаем:\n{msg.text}")
     try:
         async with typing(bot, chat_id):
             resp = await ai.messages.create(
@@ -876,8 +979,7 @@ async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
                     "role": "user",
                     "content": (
                         f"Последние сообщения в чате для контекста:\n{context_lines}\n\n---\n\n"
-                        f"Ты раньше написал в чат:\n{bot_text}\n\n"
-                        f"{author} ответил тебе на это реплаем:\n{msg.text}\n\n"
+                        f"{situation}\n\n"
                         f"Ответь ему в своём стиле. {SHORT_REPLY}"
                     ),
                 }],
@@ -887,7 +989,7 @@ async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
         text = "".join(b.text for b in resp.content if b.type == "text").strip()
     except Exception as e:
         log.exception("Не смог ответить на реплай в чате %s", chat_id)
-        text = quota_notice(chat_id, e, "отвечать на реплаи")
+        text = quota_notice(chat_id, e, "отвечать в чате")
     if text:
         await send_reply(bot, chat_id, msg.message_id, text)
 
@@ -1512,6 +1614,10 @@ def apply_prompt(chat_id: int, text: str) -> str:
     return "Ок, промпт обновлён."
 
 
+def prompt_changed(app: Application, chat_id: int):
+    app.create_task(refresh_bot_name(chat_id))
+
+
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context):
         return
@@ -1618,7 +1724,7 @@ TOGGLES = {
     "images": ("image_replies", "🖼 Реакция на картинки"),
     "stickers": ("sticker_replies", "🎭 Реакция на стикеры"),
     "voices": ("voice_replies", "🎙 Реакция на голосовые"),
-    "dialog": ("dialog_replies", "💬 Ответы на реплаи"),
+    "dialog": ("dialog_replies", "💬 Ответы на реплаи и обращения"),
 }
 TOGGLE_FIELDS = tuple(field for field, _ in TOGGLES.values())
 
@@ -1671,7 +1777,9 @@ def settings_text(chat_id: int) -> str:
         f"⏰ Саммари каждый день в {s['summary_time']}\n"
         f"📝 Промпт: {kind}\n"
         f"{toggles}\n"
-        f"🧠 Контекст реплаев: {s['dialog_context']} сообщ."
+        f"🧠 Контекст реплаев: {s['dialog_context']} сообщ.\n"
+        f"🏷 Откликаюсь на: {', '.join(x for x in (s['bot_name'], '@' + BOT_USERNAME if BOT_USERNAME else '') if x)}"
+        + ("" if s["bot_name"] else " (в промпте нет имени)")
     )
 
 
@@ -1742,6 +1850,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.strip() and msg.reply_to_message and msg.reply_to_message.text:
             text = msg.reply_to_message.text
         await msg.reply_text(apply_prompt(chat.id, text))
+        prompt_changed(context.application, chat.id)
         return
     await context.bot.send_message(chat.id, menu_text(chat.id), reply_markup=menu_kb())
     if chat.type == "channel":  # чтобы "/menu" не висел постом в канале
@@ -1763,6 +1872,7 @@ async def on_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await msg.reply_text(apply_time(context.application, chat_id, msg.text))
     elif ASK_PROMPT in asked:
         await msg.reply_text(apply_prompt(chat_id, msg.text))
+        prompt_changed(context.application, chat_id)
     elif ASK_CONTEXT in asked:
         await msg.reply_text(apply_context(chat_id, msg.text))
     else:
@@ -1835,6 +1945,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await ask_user(context, chat.id, q.from_user, "📝", ASK_PROMPT)
         case ["resetprompt"]:
             update_chat(chat.id, "prompt", None)
+            prompt_changed(context.application, chat.id)
             await q.answer("Промпт сброшен")
             await show(settings_text(chat.id), settings_kb(chat.id))
         case ["toggle", key] | ["links" as key] if key in TOGGLES:  # links — старые кнопки
@@ -1874,9 +1985,12 @@ GROUP_COMMANDS = [
 
 
 async def post_init(app: Application):
+    global BOT_USERNAME
+    BOT_USERNAME = app.bot.username or ""
     for s in all_chats():
         if s["active"]:
             schedule_chat(app, s["chat_id"])
+        app.create_task(refresh_bot_name(s["chat_id"]))  # промпт мог смениться до обновления
     # в личке команд нет — бот работает только в группах и каналах
     await app.bot.delete_my_commands(scope=BotCommandScopeDefault())
     await app.bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
