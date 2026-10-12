@@ -34,7 +34,8 @@
 
 Команды в чате (настройки у каждого чата свои, менять может любой участник):
     /menu                — меню: статистика, саммари на сейчас, настройки (время, промпт,
-                           пересказ ссылок). В канале: /menu time 21:30, /menu prompt <текст>
+                           реакции, контекст реплаев). В канале: /menu time 21:30,
+                           /menu prompt <текст>, /menu context 100
     /summary             — саммари на сейчас (только показать: память и итоги дня не трогает)
     /memory              — что бот помнит о чате (итоги дней, недель, месяцев, лет)
     /retry [N]           — перераспознать последние N неудачных голосовых/картинок
@@ -113,6 +114,13 @@ DEFAULT_PROMPT = (
 PLAIN_TEXT = (
     "Пиши обычным текстом без markdown: без **, __, `, # и маркированных списков. "
     "Эмодзи можно."
+)
+
+# для реакций в чат (голосовые, картинки, стикеры, ссылки, реплаи): люди жаловались,
+# что бот «лепит слишком много всего за раз»
+SHORT_REPLY = (
+    "Коротко и просто: 1–2 коротких предложения, одна мысль. Не пересказывай всё подряд, "
+    "не перечисляй и не впихивай всё сразу."
 )
 
 logging.basicConfig(
@@ -211,6 +219,9 @@ def _init_schema(conn: sqlite3.Connection):
         conn.execute("ALTER TABLE chats ADD COLUMN voice_replies INTEGER NOT NULL DEFAULT 1")
     if "dialog_replies" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN dialog_replies INTEGER NOT NULL DEFAULT 1")
+    # сколько последних сообщений чата бот видит, отвечая на реплай
+    if "dialog_context" not in chat_cols:
+        conn.execute("ALTER TABLE chats ADD COLUMN dialog_context INTEGER NOT NULL DEFAULT 100")
     # миграция: бот сейчас в чате? Выгнали — данные храним, но таймер не ставим
     if "active" not in chat_cols:
         conn.execute("ALTER TABLE chats ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
@@ -255,7 +266,7 @@ def get_chat(chat_id: int) -> sqlite3.Row | None:
 
 
 def update_chat(chat_id: int, field: str, value):
-    assert field in ("summary_time", "prompt", "title", "active", *TOGGLE_FIELDS)
+    assert field in ("summary_time", "prompt", "title", "active", "dialog_context", *TOGGLE_FIELDS)
     with db() as conn:
         conn.execute(f"UPDATE chats SET {field} = ? WHERE chat_id = ?", (value, chat_id))
 
@@ -829,7 +840,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- ответы на реплаи боту ----------
 
-DIALOG_CONTEXT_MESSAGES = 15  # сколько последних сообщений чата показать модели для контекста
+# сколько последних сообщений чата бот видит, отвечая на реплай — настройка чата
+DIALOG_CONTEXT_MAX = 500
+DIALOG_CONTEXT_PRESETS = [15, 50, 100, 200, 500]
 DIALOG_BOT_TEXT_CHARS = 3000  # длинные итоги дня режем — для ответа хватит начала
 
 
@@ -841,7 +854,7 @@ def replied_to_bot(msg, bot_id: int):
     if target.reply_markup:  # меню с кнопками — не разговор
         return None
     text = target.text or target.caption or ""
-    if not text or ASK_TIME in text or ASK_PROMPT in text:
+    if not text or any(ask in text for ask in (ASK_TIME, ASK_PROMPT, ASK_CONTEXT)):
         return None
     return target
 
@@ -849,7 +862,7 @@ def replied_to_bot(msg, bot_id: int):
 async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
     """Человек ответил боту реплаем — отвечаем ему в стиле промпта чата."""
     s = get_chat(chat_id)
-    recent = fetch_messages(chat_id)[-DIALOG_CONTEXT_MESSAGES:]
+    recent = fetch_messages(chat_id)[-s["dialog_context"]:]
     context_lines = build_transcript(recent) if recent else "—"
     if len(bot_text) > DIALOG_BOT_TEXT_CHARS:
         bot_text = bot_text[:DIALOG_BOT_TEXT_CHARS] + "…"
@@ -865,8 +878,7 @@ async def answer_reply(bot: Bot, chat_id: int, msg, bot_text: str, author: str):
                         f"Последние сообщения в чате для контекста:\n{context_lines}\n\n---\n\n"
                         f"Ты раньше написал в чат:\n{bot_text}\n\n"
                         f"{author} ответил тебе на это реплаем:\n{msg.text}\n\n"
-                        "Ответь ему коротко, 1–3 предложения, в своём стиле. Добавь пару "
-                        "подходящих эмодзи."
+                        f"Ответь ему в своём стиле. {SHORT_REPLY}"
                     ),
                 }],
             )
@@ -937,8 +949,7 @@ async def retell_link(note: str, prompt: str) -> str:
         messages=[{
             "role": "user",
             "content": "Человек скинул в чат ссылку. Вот что на ней (нейтральная заметка). "
-            "Перескажи коротко, 2–4 предложения, что там, и отреагируй. Добавь пару "
-            f"подходящих эмодзи.\n\n{note}",
+            f"Скажи, что там, и отреагируй. {SHORT_REPLY}\n\n{note}",
         }],
     )
     return "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -1034,8 +1045,7 @@ async def react_to_sticker(desc: str, emoji: str, prompt: str, author: str) -> s
         messages=[{
             "role": "user",
             "content": f"{author} кинул в чат стикер {emoji}. На нём: {desc or 'без текста'}. "
-            "Отреагируй одним-двумя короткими предложениями, подхвати шутку или текст "
-            "стикера. Добавь пару подходящих эмодзи.",
+            f"Отреагируй, подхвати шутку или текст стикера. {SHORT_REPLY}",
         }],
     )
     return "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -1063,8 +1073,8 @@ async def describe_images(
         "Ты смотришь картинки из чата и отвечаешь JSON с двумя полями.\n"
         "facts — нейтральное описание для хроники чата: что изображено, текст на "
         f"картинках, если это мем — в чём шутка. Без стиля, мата и оценок, {size}.\n"
-        f"post — реакция для отправки в чат, {size}, с парой подходящих эмодзи, строго "
-        "по инструкции стиля ниже. Инструкция стиля относится ТОЛЬКО к post.\n\n"
+        f"post — реакция для отправки в чат, строго по инструкции стиля ниже. {SHORT_REPLY} "
+        "Инструкция стиля относится ТОЛЬКО к post.\n\n"
         f"Инструкция стиля для post:\n{prompt}\n\n{PLAIN_TEXT}"
     )
     content = [
@@ -1153,9 +1163,8 @@ async def react_to_voice(transcript: str, prompt: str, author: str, gender: str 
         system=f"{prompt}\n\n{PLAIN_TEXT}",
         messages=[{
             "role": "user",
-            "content": "Это расшифровка голосового сообщения из чата. Отреагируй на него "
-            "в 1–3 предложениях: в чём суть и что ты об этом думаешь. "
-            "Добавь пару подходящих эмодзи.\n\n"
+            "content": "Это расшифровка голосового сообщения из чата. Отреагируй на него: "
+            f"в чём суть и что ты об этом думаешь. {SHORT_REPLY}\n\n"
             f"Автор в чате: {author}. {who}\n"
             f"Расшифровка: {transcript}",
         }],
@@ -1485,6 +1494,14 @@ def apply_time(app: Application, chat_id: int, raw: str) -> str:
     return f"Ок, саммари теперь каждый день в {value}."
 
 
+def apply_context(chat_id: int, raw: str) -> str:
+    raw = raw.strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= DIALOG_CONTEXT_MAX:
+        return f"Нужно число от 1 до {DIALOG_CONTEXT_MAX}."
+    update_chat(chat_id, "dialog_context", int(raw))
+    return f"Ок, отвечая на реплаи, буду смотреть последние {raw} сообщ."
+
+
 def apply_prompt(chat_id: int, text: str) -> str:
     text = text.strip()
     if not text:
@@ -1609,6 +1626,8 @@ TOGGLE_FIELDS = tuple(field for field, _ in TOGGLES.values())
 # сообщения-запросы бота: ответ на них реплаем меняет настройку
 ASK_TIME = "ответь реплаем на это сообщение временем саммари в формате ЧЧ:ММ, например 21:30."
 ASK_PROMPT = "ответь реплаем на это сообщение текстом нового промпта для саммари."
+ASK_CONTEXT = (f"ответь реплаем на это сообщение числом от 1 до {DIALOG_CONTEXT_MAX}: "
+               "сколько последних сообщений чата мне учитывать, отвечая на реплаи.")
 ASK_TTL = 600  # через 10 минут без ответа запрос удаляется
 
 
@@ -1651,7 +1670,8 @@ def settings_text(chat_id: int) -> str:
         "⚙️ Настройки чата\n"
         f"⏰ Саммари каждый день в {s['summary_time']}\n"
         f"📝 Промпт: {kind}\n"
-        f"{toggles}"
+        f"{toggles}\n"
+        f"🧠 Контекст реплаев: {s['dialog_context']} сообщ."
     )
 
 
@@ -1668,6 +1688,8 @@ def settings_kb(chat_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📝 Промпт", callback_data="m:prompt"),
         ],
         *toggles,
+        [InlineKeyboardButton(f"🧠 Контекст реплаев: {s['dialog_context']} сообщ.",
+                              callback_data="m:context")],
         [InlineKeyboardButton("🗑 Удалить данные чата", callback_data="m:wipe")],
         [InlineKeyboardButton("◀️ Назад", callback_data="m:home")],
     ])
@@ -1681,6 +1703,15 @@ def time_kb() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("✏️ Своё время", callback_data="m:asktime")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="m:settings")])
     return InlineKeyboardMarkup(rows)
+
+
+def context_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(n), callback_data=f"m:setcontext:{n}")
+         for n in DIALOG_CONTEXT_PRESETS],
+        [InlineKeyboardButton("✏️ Своё число", callback_data="m:askcontext")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="m:settings")],
+    ])
 
 
 def prompt_kb(custom: bool) -> InlineKeyboardMarkup:
@@ -1701,6 +1732,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if args and args[0].lower() in ("time", "время"):
         await msg.reply_text(apply_time(context.application, chat.id, " ".join(args[1:])))
+        return
+    if args and args[0].lower() in ("context", "контекст"):
+        await msg.reply_text(apply_context(chat.id, " ".join(args[1:])))
         return
     if args and args[0].lower() in ("prompt", "промпт"):
         parts = msg.text.split(maxsplit=2)  # сохраняем переносы строк
@@ -1729,6 +1763,8 @@ async def on_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await msg.reply_text(apply_time(context.application, chat_id, msg.text))
     elif ASK_PROMPT in asked:
         await msg.reply_text(apply_prompt(chat_id, msg.text))
+    elif ASK_CONTEXT in asked:
+        await msg.reply_text(apply_context(chat_id, msg.text))
     else:
         return False
     with contextlib.suppress(Exception):  # запрос больше не нужен — убираем из чата
@@ -1773,6 +1809,20 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         case ["asktime"]:
             await q.answer()
             await ask_user(context, chat.id, q.from_user, "⏰", ASK_TIME)
+        case ["context"]:
+            await q.answer()
+            s = get_chat(chat.id)
+            await show(
+                f"🧠 Отвечая на реплаи, я смотрю последние {s['dialog_context']} сообщ. чата.\n"
+                f"Больше — лучше понимаю разговор, но дороже. Выбери (до {DIALOG_CONTEXT_MAX}):",
+                context_kb(),
+            )
+        case ["setcontext", value] if value.isdigit():
+            await q.answer(apply_context(chat.id, value))
+            await show(settings_text(chat.id), settings_kb(chat.id))
+        case ["askcontext"]:
+            await q.answer()
+            await ask_user(context, chat.id, q.from_user, "🧠", ASK_CONTEXT)
         case ["prompt"]:
             await q.answer()
             s = get_chat(chat.id)
